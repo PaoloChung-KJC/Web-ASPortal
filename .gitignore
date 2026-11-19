@@ -1,0 +1,9 @@
+.venv/
+.env
+.env.local
+__pycache__/
+*.pyc
+dev.db
+uploads/
+logs/
+.superpowers/
