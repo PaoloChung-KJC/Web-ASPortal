@@ -22,6 +22,7 @@ DEV_ACCOUNTS = [
 ]
 DEV_PASSWORD = "local-dev-1234"
 PRODUCT_GROUPS = [("K215", "21.5형 키오스크"), ("K238", "23.8형 키오스크"), ("ETC", "기타")]
+KINDS = [("CS", "CS (현장)"), ("AS", "AS (입고 수리)")]   # crm-rma seed 의 AS_KIND 와 같은 값
 
 
 def main() -> int:
@@ -33,13 +34,15 @@ def main() -> int:
     try:
         if not db.get(Company, 1):
             db.add_all([Company(id=1, name="시험고객 가"), Company(id=2, name="시험고객 나")])
-        grp = db.query(CommonCodeGroup).filter_by(group_code="AS_PRODUCT_GROUP").first()
-        if not grp:
-            grp = CommonCodeGroup(group_code="AS_PRODUCT_GROUP", group_name="A/S 제품군")
-            db.add(grp)
-            db.flush()
-            for n, (code, name) in enumerate(PRODUCT_GROUPS):
-                db.add(CommonCode(group_id=grp.id, code=code, display_name=name, sort_order=n, use_yn="Y"))
+        for group_code, group_name, codes in (("AS_PRODUCT_GROUP", "A/S 제품군", PRODUCT_GROUPS),
+                                              ("AS_KIND", "A/S 구분", KINDS)):
+            grp = db.query(CommonCodeGroup).filter_by(group_code=group_code).first()
+            if not grp:
+                grp = CommonCodeGroup(group_code=group_code, group_name=group_name)
+                db.add(grp)
+                db.flush()
+                for n, (code, name) in enumerate(codes):
+                    db.add(CommonCode(group_id=grp.id, code=code, display_name=name, sort_order=n, use_yn="Y"))
         for company_id, login_id, must_change in DEV_ACCOUNTS:
             if not db.query(AsPortalAccount).filter_by(login_id=login_id).first():
                 db.add(AsPortalAccount(company_id=company_id, login_id=login_id,

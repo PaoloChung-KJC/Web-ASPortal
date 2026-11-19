@@ -17,8 +17,9 @@ SYMPTOM_MAX = 4000
 CUSTOMER_STATUS_LABEL = {"received": "접수됨", "progress": "처리 중", "done": "완료", "canceled": "취소됨"}
 
 # 고객에게 내보내도 되는 칸 (이 목록에 없는 칸은 절대 내보내지 않는다)
+# method = 접수 구분(공통코드 AS_KIND: CS 현장 / AS 입고 수리). 2026-11-19 부터 고객이 접수할 때 직접 고른다
 PORTAL_FIELDS = (
-    "id", "as_no", "received_date", "reporter_name", "reporter_phone", "product_group",
+    "id", "as_no", "received_date", "reporter_name", "reporter_phone", "method", "product_group",
     "model_text", "qty", "symptom", "site_name", "site_address", "site_phone", "customer_notice",
 )
 

@@ -271,6 +271,23 @@ input:disabled, select:disabled, textarea:disabled { background: #f5f6f8; color:
 .row-2 { display: grid; grid-template-columns: 1fr; gap: 14px; }
 @media (min-width: 560px) { .row-2 { grid-template-columns: 1fr 1fr; } }
 
+/* 접수 구분: 크게 누를 수 있는 선택 칸 두 개 */
+.kinds { display: grid; grid-template-columns: 1fr; gap: 10px; }
+@media (min-width: 560px) { .kinds { grid-template-columns: 1fr 1fr; } }
+.kind {
+  display: flex; align-items: flex-start; gap: 12px;
+  min-height: 64px; padding: 14px 16px; cursor: pointer;
+  background: #fbfcfd; border: 1.5px solid var(--line-strong); border-radius: 12px;
+  transition: border-color .15s, background-color .15s, box-shadow .15s;
+}
+.kind:hover { border-color: #aeb7c6; }
+.kind.on { background: var(--accent-soft); border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47, 111, 214, .14); }
+.kind input { flex-shrink: 0; width: 20px; height: 20px; margin: 2px 0 0; accent-color: var(--accent); cursor: pointer; }
+.kind-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.kind-title { font-size: 16px; font-weight: 700; }
+.kind-desc { font-size: 13px; color: var(--muted); }
+.kind.on .kind-title { color: var(--accent-strong); }
+
 .chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; }
 .chips-label { font-size: 13px; color: var(--muted); width: 100%; }
 .chip {

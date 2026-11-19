@@ -463,12 +463,19 @@ function ListScreen({ filter, setFilter }) {
 
 // ---- 접수 · 수정 양식 ----
 
+// method = 접수 구분(현장 / 입고 수리). 처음에는 비워 두고 고객이 반드시 고른다
 const EMPTY_FIELDS = {
-  reporter_name: "", reporter_phone: "", product_group: "", qty: "1", model_text: "",
+  reporter_name: "", reporter_phone: "", method: "", product_group: "", qty: "1", model_text: "",
   symptom: "", site_name: "", site_address: "", site_phone: "",
 };
 const FIELD_KEYS = Object.keys(EMPTY_FIELDS);
 const SITE_KEYS = ["site_name", "site_address", "site_phone"];
+// 접수 구분을 고객이 알아보기 쉬운 말로 (공통코드 AS_KIND 의 code 기준. 모르는 code 는 서버가 준 이름 그대로)
+const KIND_TEXT = {
+  CS: { title: "현장 수리", desc: "설치된 곳으로 방문해 수리합니다" },
+  AS: { title: "입고 수리", desc: "제품을 보내 주시면 수리 후 돌려드립니다" },
+};
+const kindTitle = (code, name) => (KIND_TEXT[code] ? KIND_TEXT[code].title : name || code || "");
 
 function initialFields(mode, c) {
   const f = { ...EMPTY_FIELDS };
@@ -492,6 +499,7 @@ const PHOTO_REQUIRED_MSG = "사진을 1장 이상 올려 주세요";
 function validate(f) {
   if (!f.reporter_name.trim()) return "접수자 이름을 입력해 주세요";
   if (!f.reporter_phone.trim()) return "접수자 연락처를 입력해 주세요";
+  if (!f.method) return "접수 구분을 선택해 주세요";
   if (!f.product_group) return "제품군을 선택해 주세요";
   const q = f.qty.trim();
   if (!/^\d+$/.test(q) || Number(q) < 1 || Number(q) > QTY_MAX) return "수량을 확인해 주세요";
@@ -511,7 +519,7 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
   const [init] = useState(() => initialFields(mode, initial));
   const [fields, setFields] = useState(init.fields);
   const [restored, setRestored] = useState(init.restored);
-  const [opts, setOpts] = useState({ loading: true, error: "", groups: [], reporters: [] });
+  const [opts, setOpts] = useState({ loading: true, error: "", groups: [], kinds: [], reporters: [] });
   const [photos, setPhotos] = useState([]); // [{key, blob, url}] — 접수 때만
   const [preparing, setPreparing] = useState(false);
   const [photoNotes, setPhotoNotes] = useState([]);
@@ -541,7 +549,7 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
     setOpts((o) => ({ ...o, loading: true, error: "" }));
     try {
       const r = await api("/options");
-      setOpts({ loading: false, error: "", groups: r.product_groups || [], reporters: r.recent_reporters || [] });
+      setOpts({ loading: false, error: "", groups: r.product_groups || [], kinds: r.kinds || [], reporters: r.recent_reporters || [] });
     } catch (e) {
       setOpts((o) => ({ ...o, loading: false, error: e.message }));
     }
@@ -706,6 +714,24 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
               <input id="f-phone" type="tel" inputMode="tel" value={fields.reporter_phone} maxLength={40} autoComplete="tel"
                 placeholder="010-0000-0000" onChange={(e) => setField("reporter_phone", e.target.value)} />
             </div>
+          </div>
+        </div>
+
+        {/* 2026-11-19: 접수 구분 — 처음에는 아무것도 고르지 않은 상태, 반드시 골라야 접수된다. 직원 화면의 '구분'으로 그대로 들어간다 */}
+        <div className="card form">
+          <h2 className="section-title" id="f-kind-title">접수 구분 <span className="req">(필수)</span></h2>
+          <div className="kinds" role="radiogroup" aria-labelledby="f-kind-title">
+            {opts.kinds.map((k) => (
+              <label key={k.code} className={"kind" + (fields.method === k.code ? " on" : "")}>
+                <input type="radio" name="f-kind" value={k.code} checked={fields.method === k.code}
+                  onChange={() => setField("method", k.code)} />
+                <span className="kind-body">
+                  <span className="kind-title">{kindTitle(k.code, k.name)}</span>
+                  {KIND_TEXT[k.code] && <span className="kind-desc">{KIND_TEXT[k.code].desc}</span>}
+                </span>
+              </label>
+            ))}
+            {opts.loading && opts.kinds.length === 0 && <p className="muted">불러오는 중…</p>}
           </div>
         </div>
 
@@ -1044,6 +1070,7 @@ function CaseScreen({ id }) {
           <dl className="info">
             <InfoRow label="접수자" value={c.reporter_name} />
             <InfoRow label="연락처" value={c.reporter_phone} />
+            <InfoRow label="접수 구분" value={c.method ? kindTitle(c.method, c.method_name) : ""} />
             <InfoRow label="제품군" value={c.product_group_name} />
             <InfoRow label="모델명 / 시리얼" value={c.model_text} />
             <InfoRow label="수량" value={c.qty} />

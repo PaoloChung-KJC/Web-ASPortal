@@ -35,6 +35,7 @@ CASE_NOT_FOUND = "접수 건을 찾을 수 없습니다"
 PHOTO_NOT_FOUND = "사진을 찾을 수 없습니다"
 ALREADY_CONFIRMED = "이미 확인된 접수입니다. 변경은 담당자에게 문의해 주세요"
 PRODUCT_GROUP = "AS_PRODUCT_GROUP"
+KIND_GROUP = "AS_KIND"   # 접수 구분: CS(현장) / AS(입고 수리) — 직원 화면의 '구분'(as_case.method)과 같은 칸
 
 # 고객이 고칠 수 있는 글자 칸 (길이 검사 대상)
 _TEXT_FIELDS = ("reporter_name", "reporter_phone", "model_text", "site_name", "site_address", "site_phone")
@@ -65,7 +66,15 @@ def _detail(db: Session, c: AsCase) -> dict:
     d = portal_view(c, c.photos)
     names = code_names(db, PRODUCT_GROUP)
     d["product_group_name"] = names.get(c.product_group, c.product_group) if c.product_group else None
+    d["method_name"] = code_names(db, KIND_GROUP).get(c.method, c.method) if c.method else None
     return d
+
+
+def _active_codes(db: Session, group_code: str) -> list:
+    """쓰는 중(use_yn=Y)인 공통코드를 화면 순서대로."""
+    return (db.query(CommonCode).join(CommonCodeGroup, CommonCodeGroup.id == CommonCode.group_id)
+            .filter(CommonCodeGroup.group_code == group_code, CommonCode.use_yn == "Y")
+            .order_by(CommonCode.sort_order, CommonCode.id).all())
 
 
 def _bump_case_rev(db: Session, case_id: int, reporter_name: Optional[str]) -> None:
@@ -124,6 +133,15 @@ def _clean_group(db: Session, v) -> str:
     return v
 
 
+def _clean_kind(db: Session, v) -> str:
+    if not isinstance(v, str) or not v.strip():
+        raise HTTPException(400, "접수 구분을 선택해 주세요")
+    v = v.strip()
+    if v not in {r.code for r in _active_codes(db, KIND_GROUP)}:
+        raise HTTPException(400, "접수 구분을 확인해 주세요")
+    return v
+
+
 def _apply(db: Session, c: AsCase, data: dict, creating: bool) -> None:
     """허용된 칸만 검증해 반영한다. 수정 때는 키가 있는 칸만 건드린다."""
     for f in _TEXT_FIELDS:
@@ -135,6 +153,8 @@ def _apply(db: Session, c: AsCase, data: dict, creating: bool) -> None:
             if not v:
                 raise HTTPException(400, f"{label} 입력해 주세요")
             setattr(c, f, v)
+    if creating or "method" in data:
+        c.method = _clean_kind(db, data.get("method"))
     if creating or "product_group" in data:
         c.product_group = _clean_group(db, data.get("product_group"))
     if creating or "qty" in data:
@@ -201,9 +221,8 @@ def change_password(payload: dict, db: Session = Depends(get_db),
 
 @router.get("/options")
 def options(db: Session = Depends(get_db), account: AsPortalAccount = Depends(get_active_account)):
-    rows = (db.query(CommonCode).join(CommonCodeGroup, CommonCodeGroup.id == CommonCode.group_id)
-            .filter(CommonCodeGroup.group_code == PRODUCT_GROUP, CommonCode.use_yn == "Y")
-            .order_by(CommonCode.sort_order, CommonCode.id).all())
+    rows = _active_codes(db, PRODUCT_GROUP)
+    kinds = _active_codes(db, KIND_GROUP)
     seen, reporters = set(), []
     recent = (db.query(AsCase.reporter_name, AsCase.reporter_phone).filter(AsCase.company_id == account.company_id)
               .order_by(AsCase.id.desc()).limit(200).all())
@@ -215,6 +234,7 @@ def options(db: Session = Depends(get_db), account: AsPortalAccount = Depends(ge
         if len(reporters) == 5:
             break
     return {"product_groups": [{"code": r.code, "name": r.display_name} for r in rows],
+            "kinds": [{"code": r.code, "name": r.display_name} for r in kinds],
             "recent_reporters": reporters}
 
 

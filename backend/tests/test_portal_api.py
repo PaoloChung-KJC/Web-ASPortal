@@ -40,7 +40,7 @@ class PortalApiTest(unittest.TestCase):
         self.db = sessionmaker(bind=engine)()
         self.db.add_all([Company(id=1, name="가고객"), Company(id=2, name="나고객")])
         for gc, codes in {"AS_PRODUCT_GROUP": [("T10", "T10형"), ("K13", "K13형")],
-                          "AS_KIND": [("CS", "CS (현장)")], "AS_FAULT": [("MAT", "자재")]}.items():
+                          "AS_KIND": [("CS", "CS (현장)"), ("AS", "AS (입고 수리)")], "AS_FAULT": [("MAT", "자재")]}.items():
             grp = CommonCodeGroup(group_code=gc, group_name=gc)
             self.db.add(grp)
             self.db.flush()
@@ -121,7 +121,7 @@ class PortalApiTest(unittest.TestCase):
         return {"Authorization": f"Bearer {tok or self.tokA}"}
 
     def body(self, **kw):
-        b = dict(reporter_name="홍길동", reporter_phone="010-1111-2222", product_group="T10", qty=1,
+        b = dict(reporter_name="홍길동", reporter_phone="010-1111-2222", method="CS", product_group="T10", qty=1,
                  symptom="화면이 안 나와요")
         b.update(kw)
         return b
@@ -441,7 +441,7 @@ class PortalApiTest(unittest.TestCase):
             r = self.raw_create(**kw)
             self.assertEqual((r.status_code, r.json()["detail"]), (400, "수량을 확인해 주세요"), kw)
         self.assertEqual(self.create(qty=9999)["qty"], 9999)
-        for drop in ("reporter_name", "reporter_phone", "product_group", "symptom", "qty"):
+        for drop in ("reporter_name", "reporter_phone", "method", "product_group", "symptom", "qty"):
             b = self.body()
             b.pop(drop)
             self.assertEqual(self.client.post("/api/portal/cases", json=b, headers=self.h()).status_code, 400, drop)
@@ -528,6 +528,56 @@ class PortalApiTest(unittest.TestCase):
 
     def test_health_needs_no_login(self):
         self.assertEqual(self.client.get("/api/portal/health").json(), {"status": "ok"})
+
+
+    # ---- 접수 구분 (현장 / 입고 수리) — 고객이 접수할 때 고른다. 직원 화면의 '구분'(as_case.method)과 같은 칸 ----
+    def test_kind_is_required_and_saved_to_staff_field(self):
+        for bad, msg in ((None, "접수 구분을 선택해 주세요"), ("", "접수 구분을 선택해 주세요"), ("  ", "접수 구분을 선택해 주세요"),
+                         ("ZZ", "접수 구분을 확인해 주세요"), (1, "접수 구분을 선택해 주세요")):
+            r = self.raw_create(method=bad)
+            self.assertEqual((r.status_code, r.json()["detail"]), (400, msg), bad)
+        self.assertEqual(self.db.query(AsCase).count(), 0)
+        c = self.create(method="AS")
+        self.assertEqual((c["method"], c["method_name"]), ("AS", "AS (입고 수리)"))
+        self.assertEqual(self.db.get(AsCase, c["id"]).method, "AS")       # 직원 화면이 읽는 칸에 그대로 들어간다
+        d = self.client.get(f"/api/portal/cases/{c['id']}", headers=self.h()).json()
+        self.assertEqual((d["method"], d["method_name"]), ("AS", "AS (입고 수리)"))
+
+    def test_kind_options_listed(self):
+        j = self.client.get("/api/portal/options", headers=self.h()).json()
+        self.assertEqual(j["kinds"], [{"code": "CS", "name": "CS (현장)"}, {"code": "AS", "name": "AS (입고 수리)"}])
+
+    def test_unused_kind_is_not_offered_or_accepted(self):
+        code = self.db.query(CommonCode).filter_by(code="AS").one()
+        code.use_yn = "N"
+        self.db.commit()
+        j = self.client.get("/api/portal/options", headers=self.h()).json()
+        self.assertEqual([k["code"] for k in j["kinds"]], ["CS"])
+        self.assertEqual(self.raw_create(method="AS").status_code, 400)
+
+    def test_kind_can_be_changed_while_received_only(self):
+        cid = self.create(method="CS")["id"]
+        r = self.client.put(f"/api/portal/cases/{cid}", json={"method": "AS"}, headers=self.h())
+        self.assertEqual((r.status_code, r.json()["method"]), (200, "AS"))
+        self.assertEqual(self.client.put(f"/api/portal/cases/{cid}", json={"method": "ZZ"}, headers=self.h()).status_code, 400)
+        self.assertEqual(self.client.put(f"/api/portal/cases/{cid}", json={"method": ""}, headers=self.h()).status_code, 400)
+        self.assertEqual(self.client.put(f"/api/portal/cases/{cid}", json={"qty": 2}, headers=self.h()).status_code, 200)
+        self.assertEqual(self.db.get(AsCase, cid).method, "AS")           # 키가 없으면 건드리지 않는다
+        self.staff_save(cid, part_no="KJC-1", method="CS")                # 직원이 확인하며 구분을 고침
+        r = self.client.put(f"/api/portal/cases/{cid}", json={"method": "AS"}, headers=self.h())
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.db.get(AsCase, cid).method, "CS")
+        self.assertEqual(self.client.get(f"/api/portal/cases/{cid}", headers=self.h()).json()["method"], "CS")
+
+    def test_old_case_without_kind_still_opens(self):
+        # 이 칸이 생기기 전에 접수된 건(구분 없음)도 목록·상세가 열린다
+        cid = self.create()["id"]
+        row = self.db.get(AsCase, cid)
+        row.method = None
+        self.db.commit()
+        d = self.client.get(f"/api/portal/cases/{cid}", headers=self.h()).json()
+        self.assertEqual((d["method"], d["method_name"]), (None, None))
+        self.assertEqual(self.client.get("/api/portal/cases", headers=self.h()).status_code, 200)
 
 
 if __name__ == "__main__":
