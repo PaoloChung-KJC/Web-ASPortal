@@ -382,12 +382,21 @@ a.case-card:hover { border-color: #b9cdf2; box-shadow: 0 2px 4px rgba(16, 24, 40
 .case-head-no { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
 .case-head-date { margin-top: 4px; color: var(--muted); font-size: 15px; }
 
+/* KJC 안내(직원이 고객에게 적은 글): 칸 전체에 색을 넣어 한눈에 띄게 (2026-11-19 요청) */
 .notice {
-  background: var(--card);
-  border: 1px solid #c4d8ec; border-left: 4px solid var(--accent);
-  border-radius: var(--radius); padding: 14px 16px;
+  background: #e3edff;
+  border: 1.5px solid #9dbcf3; border-left: 7px solid var(--accent);
+  border-radius: var(--radius); padding: 16px 18px;
+  box-shadow: 0 2px 4px rgba(31, 87, 179, .08), 0 8px 20px rgba(47, 111, 214, .14);
 }
-.notice-title { font-size: 15px; font-weight: 700; color: var(--accent-strong); margin-bottom: 6px; }
+.notice-title {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 800; letter-spacing: 0; color: #fff;
+  background: var(--accent); padding: 4px 12px; border-radius: 999px; margin-bottom: 10px;
+}
+.notice-title::before { content: "!"; display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; border-radius: 50%; background: #fff; color: var(--accent); font-size: 12px; font-weight: 900; }
+.notice p { font-size: 17px; font-weight: 600; line-height: 1.55; color: #12305f; }
 
 .info { margin: 0; }
 .info-row { display: grid; grid-template-columns: 1fr; gap: 2px; padding: 10px 0; border-top: 1px solid var(--line); }
