@@ -274,6 +274,40 @@ DB 구조는 어느 단계에서도 바뀌지 않는다. 새 서버로 받은 �
   4. `python -m app.preflight` (5절) → 모두 `[확인]`
 - NAS 가 다시 켜지면: 프로그램은 다음 요청에서 DB 에 스스로 다시 붙는다. 사진 폴더가 안 보이면 사진 올리기만 "잠시 후 다시" 로 실패하고 접수 글은 된다.
 
+## 13. 영상 변환 (ffmpeg) — 2026-11-24 추가
+
+고객이 올린 영상은 서버에서 **ffmpeg** 로 FHD(1920×1080 안) MP4 로 줄여 저장하고 원본은 지운다.
+ffmpeg 가 없거나 변환에 실패하면 **원본을 그대로 둔다**(접수는 된다). 변환은 응답 뒤에 따로, 한 번에 하나씩, 낮은 우선순위로 돈다.
+
+1. ffmpeg 설치 — ffmpeg.org 의 Windows 빌드 안내(https://ffmpeg.org/download.html#build-windows)에서
+   **gyan.dev 의 `ffmpeg-release-essentials.zip`** 을 받아 압축을 풀고, 안의 폴더를 `C:\ffmpeg` 로 옮긴다
+   (`C:\ffmpeg\bin\ffmpeg.exe` 가 있어야 한다). 설치 프로그램이 아니라 파일 복사뿐이다.
+
+```powershell
+C:\ffmpeg\bin\ffmpeg.exe -version
+```
+
+2. 작업 폴더 — 큰 영상을 받는 임시 파일과 변환 중 파일을 두는 곳. 전용 계정이 쓸 수 있어야 한다(`web.config` 의 TEMP · TMP 가 여기를 가리킨다):
+
+```powershell
+New-Item -ItemType Directory -Force C:\Webproject\Web-ASPortal\work
+icacls C:\Webproject\Web-ASPortal\work /grant "<서비스 계정>:(OI)(CI)M"
+```
+
+3. `backend\.env` 에 한 줄 더한다:
+
+```text
+FFMPEG_PATH=C:\ffmpeg\bin\ffmpeg.exe
+```
+
+   (선택) `VIDEO_MAX_MB` = 영상 원본 한 개 한도(기본 1024). 바꾸면 `web.config` 의 `maxAllowedContentLength` 도 그보다 조금 크게 맞춘다.
+
+4. 앱 풀 재생 후 `logs\portal_*.log` 에 `영상 변환 프로그램: C:\ffmpeg\bin\ffmpeg.exe` 가 찍히면 된다.
+   `ffmpeg 를 찾지 못했습니다` 가 찍히면 3 의 경로를 확인한다.
+
+- 변환 중에 앱 풀이 재생되면 그 영상은 원본으로 남는다(다시 변환하지 않는다).
+- `work` 폴더에 남은 파일(재생 · 재시작으로 끊긴 것)은 앱 풀이 멈춘 상태에서 지워도 된다.
+
 ## 12. HttpPlatformHandler 가 이 서버에서 맞지 않을 때
 
 대안은 "프로그램을 Windows 서비스로 따로 띄우고(NSSM 등) IIS 는 ARR 로 넘기기"다.

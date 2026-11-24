@@ -10,7 +10,19 @@ const NET_MSG = "연결이 원활하지 않습니다. 잠시 후 다시 시도�
 const MUST_CHANGE_MSG = "비밀번호를 먼저 변경해 주세요";
 const BAD_PHOTO_MSG = "이 사진은 올릴 수 없습니다";
 const PHOTO_MAX = 10;
-const PHOTO_LONG_SIDE = 1600;
+const PHOTO_LONG_SIDE = 2048; // 2026-11-24: 2K (전에는 1600)
+// 2026-11-24: 영상 — 길이 제한 없음, 원본 한 개 1GB 까지. 서버가 FHD 로 줄여 저장한다(backend VIDEO_MAX_MB 와 같게)
+const VIDEO_MAX = 3;
+const VIDEO_MAX_MB = 1024;
+const VIDEO_EXT = /\.(mp4|m4v|mov|3gp|3g2|webm|mkv)$/i;
+// 2026-11-24: 증상 예시 — 고객이 골라 쓰고, 없거나 더 적을 내용은 '기타 · 추가 증상 설명'에
+const SYMPTOM_EXAMPLES = [
+  "프린터와 바코드 전원은 들어오나 화면이 안나옵니다.",
+  "화면은 켜지나 이상하게 나옵니다.",
+  "화면에 물방울이 생기고 터치가 안됩니다.",
+  "프린터 출력시 글자가 이상하게 나옵니다(깨져서 출력되는거 포함).",
+  "프린터 출력이 안됩니다.",
+];
 const PW_MIN = 8;
 const QTY_MAX = 9999;
 const FILTERS = [["all", "전체"], ["progress", "진행 중"], ["done", "완료·취소"]];
@@ -79,10 +91,63 @@ async function api(path, opts = {}) {
   throw apiError(res.status, detail);
 }
 
-function uploadPhoto(caseId, blob, n) {
+// 사진·영상 한 개 올리기. 진행률(0~100)을 알려 주려고 fetch 대신 XMLHttpRequest — 오류 처리는 api() 와 같게
+function uploadMedia(caseId, item, n, onProgress) {
   const form = new FormData();
-  form.append("file", blob, `photo-${n}.jpg`);
-  return api(`/cases/${caseId}/photos`, { method: "POST", form });
+  form.append("file", item.blob, item.kind === "video" ? (item.name || `video-${n}.mp4`) : `photo-${n}.jpg`);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API}/cases/${caseId}/photos`);
+    const token = readStore("localStorage", TOKEN_KEY);
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    if (onProgress && xhr.upload) {
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(Math.floor((e.loaded / e.total) * 100)); };
+    }
+    xhr.onerror = () => reject(apiError(0, NET_MSG));
+    xhr.ontimeout = () => reject(apiError(0, NET_MSG));
+    xhr.onload = () => {
+      let j = null;
+      try { j = JSON.parse(xhr.responseText); } catch (e) { /* 아래에서 처리 */ }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (j) resolve(j); else reject(apiError(0, NET_MSG));
+        return;
+      }
+      let detail = j && typeof j.detail === "string" ? j.detail : "";
+      if (xhr.status === 401) {
+        if (authEvents.onLost) authEvents.onLost(detail);
+      } else if (xhr.status === 403 && detail === MUST_CHANGE_MSG) {
+        if (authEvents.onMustChange) authEvents.onMustChange();
+      }
+      if (xhr.status === 413) detail = `파일이 너무 큽니다. 영상은 한 개 ${VIDEO_MAX_MB.toLocaleString()}MB 까지 올릴 수 있습니다`;
+      if (!detail) detail = xhr.status >= 502 ? NET_MSG : `요청을 처리하지 못했습니다 (오류 ${xhr.status})`;
+      reject(apiError(xhr.status, detail));
+    };
+    xhr.send(form);
+  });
+}
+
+const isVideoFile = (f) => (f.type ? f.type.startsWith("video/") : VIDEO_EXT.test(f.name || ""));
+const countKind = (list, kind) => list.filter((x) => (x.kind || "photo") === kind).length;
+
+// 증상 = 고른 예시(· 로 시작하는 줄) + 빈 줄 + 기타 · 추가 설명. 직원 화면에는 이 글이 그대로 '증상'으로 보인다
+function composeSymptom(picks, extra) {
+  const lines = picks.map((p) => `· ${p}`).join("\n");
+  const more = (extra || "").trim();
+  if (lines && more) return `${lines}\n\n${more}`;
+  return lines || more;
+}
+
+// 저장된 증상 글을 다시 (고른 예시, 추가 설명)으로 나눈다. 예전 접수(자유 글)는 전부 추가 설명으로
+function splitSymptom(text) {
+  const lines = String(text || "").split("\n");
+  const picks = [];
+  let i = 0;
+  while (i < lines.length && lines[i].startsWith("· ") && SYMPTOM_EXAMPLES.includes(lines[i].slice(2))) {
+    picks.push(lines[i].slice(2));
+    i += 1;
+  }
+  if (picks.length && i < lines.length && lines[i] === "") i += 1;
+  return { picks, extra: lines.slice(i).join("\n") };
 }
 
 function newClientKey() {
@@ -139,19 +204,108 @@ async function shrinkImage(file) {
   }
 }
 
-// 고른 파일들을 줄인다: 10장 넘는 몫은 받지 않고, 줄이지 못한 파일은 이름을 모아 알린다
-async function shrinkFiles(files, room) {
-  const take = files.slice(0, Math.max(room, 0));
-  const over = files.length - take.length;
-  const blobs = [];
+// 고른 파일들을 준비한다: 사진은 줄이고(2K), 영상은 그대로(서버가 FHD 로 줄인다).
+// 한도(사진 10장 · 영상 3개)를 넘는 몫은 받지 않고, 쓸 수 없는 파일은 이름을 모아 알린다
+async function prepareFiles(files, photoRoom, videoRoom) {
+  const items = [];
   const bad = [];
-  for (const f of take) {
-    try { blobs.push(await shrinkImage(f)); } catch (e) { bad.push(f.name || "사진"); }
+  const tooBig = [];
+  let overPhoto = 0;
+  let overVideo = 0;
+  for (const f of files) {
+    if (isVideoFile(f)) {
+      if (videoRoom <= 0) { overVideo += 1; continue; }
+      if (f.size > VIDEO_MAX_MB * 1024 * 1024) { tooBig.push(f.name || "영상"); continue; }
+      videoRoom -= 1;
+      items.push({ kind: "video", blob: f, name: f.name || "" });
+      continue;
+    }
+    if (photoRoom <= 0) { overPhoto += 1; continue; }
+    try {
+      items.push({ kind: "photo", blob: await shrinkImage(f) });
+      photoRoom -= 1;
+    } catch (e) { bad.push(f.name || "사진"); }
   }
   const notes = [];
   if (bad.length) notes.push({ kind: "warn", text: `${BAD_PHOTO_MSG} — ${bad.join(", ")}` });
-  if (over > 0) notes.push({ kind: "warn", text: `사진은 최대 ${PHOTO_MAX}장까지 올릴 수 있습니다. ${over}장은 넣지 않았습니다` });
-  return { blobs, notes };
+  if (tooBig.length) notes.push({ kind: "warn", text: `영상은 한 개 ${VIDEO_MAX_MB.toLocaleString()}MB 까지 올릴 수 있습니다 — ${tooBig.join(", ")}` });
+  if (overPhoto > 0) notes.push({ kind: "warn", text: `사진은 최대 ${PHOTO_MAX}장까지 올릴 수 있습니다. ${overPhoto}장은 넣지 않았습니다` });
+  if (overVideo > 0) notes.push({ kind: "warn", text: `영상은 최대 ${VIDEO_MAX}개까지 올릴 수 있습니다. ${overVideo}개는 넣지 않았습니다` });
+  return { items, notes };
+}
+
+// 여러 개를 차례로 올린다. 401 이면 멈추고 { stopped: true }
+async function uploadAll(caseId, items, startN, setUpload) {
+  let failed = 0;
+  let lastErr = "";
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const label = it.kind === "video" ? "영상 올리는 중" : "사진 올리는 중";
+    setUpload({ label, current: i + 1, total: items.length, pct: null });
+    try {
+      await uploadMedia(caseId, it, startN + i + 1, it.kind === "video"
+        ? (pct) => setUpload({ label, current: i + 1, total: items.length, pct })
+        : null);
+    } catch (err) {
+      if (err.status === 401) return { failed: failed + items.length - i, lastErr: err.message, stopped: true };
+      failed += 1;
+      lastErr = err.message;
+    }
+  }
+  return { failed, lastErr, stopped: false };
+}
+
+// ---- 증상 고르기 (아래에서 올라오는 선택 창 — 폰. PC·태블릿은 가운데 창) ----
+
+function SymptomSheet({ selected, onDone, onClose }) {
+  const [picked, setPicked] = useState(selected);
+  // 창 자체에 초점을 둔다 — 첫 항목에 두면 그 항목에 파란 네모(초점 테두리)가 떠서 골라 둔 것처럼 보인다
+  const boxRef = useRef(null);
+  useEffect(() => {
+    const prev = document.activeElement;
+    if (boxRef.current) boxRef.current.focus();
+    const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); onClose(); } };
+    document.addEventListener("keydown", onKey);
+    document.body.classList.add("no-scroll");
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.classList.remove("no-scroll");
+      if (prev && prev.focus) prev.focus();
+    };
+  }, [onClose]);
+  const toggle = (s) => setPicked((p) => (p.includes(s) ? p.filter((x) => x !== s) : p.concat([s])));
+  // 고른 순서가 아니라 목록 순서로 담는다
+  const done = () => onDone(SYMPTOM_EXAMPLES.filter((s) => picked.includes(s)));
+  return (
+    <div className="sheet-wrap" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" tabIndex={-1} ref={boxRef}>
+        <div className="sheet-head">
+          <h2 className="sheet-title" id="sheet-title">증상 선택</h2>
+          <button type="button" className="sheet-close" onClick={onClose} aria-label="닫기">✕</button>
+        </div>
+        <p className="sheet-hint">해당하는 증상을 모두 골라 주세요. 여러 개를 고를 수 있습니다.</p>
+        <ul className="sheet-list">
+          {SYMPTOM_EXAMPLES.map((s, i) => {
+            const on = picked.includes(s);
+            return (
+              <li key={s}>
+                <button type="button" className={"sheet-item" + (on ? " on" : "")}
+                  aria-pressed={on} onClick={() => toggle(s)}>
+                  <span className="sheet-check" aria-hidden="true">{on ? "✓" : ""}</span>
+                  <span className="sheet-text">{s}</span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+        <div className="sheet-foot">
+          <button type="button" className="btn btn-primary btn-lg btn-block" onClick={done}>
+            {picked.length ? `선택 완료 (${picked.length})` : "선택 완료"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ---- 화면 전환 (location.hash — 폰 뒤로 가기 동작) ----
@@ -236,6 +390,22 @@ function Progress({ current, total, label }) {
     <div className="progress" role="status" aria-live="polite">
       <div className="progress-text">{label} {current}/{total}</div>
       <div className="progress-bar" aria-hidden="true"><span style={{ width: `${pct}%` }} /></div>
+    </div>
+  );
+}
+
+// 사진·영상 올리기 진행 — 영상은 그 파일의 보낸 % 를 막대에 반영한다
+function UploadProgress({ up }) {
+  const { current, total, label, pct } = up;
+  const share = total ? 100 / total : 0;
+  const width = Math.round(Math.max(current - 1, 0) * share + (pct != null ? (pct / 100) * share : 0));
+  return (
+    <div className="progress" role="status" aria-live="polite">
+      <div className="progress-text">
+        {label} {current}/{total}{pct != null ? ` · ${pct}%` : ""}
+      </div>
+      <div className="progress-bar" aria-hidden="true"><span style={{ width: `${width}%` }} /></div>
+      {pct != null && <div className="progress-sub">영상은 크기에 따라 시간이 걸립니다. 화면을 닫지 말고 기다려 주세요.</div>}
     </div>
   );
 }
@@ -365,7 +535,7 @@ function CaseCard({ row }) {
         <div className="case-card-meta">
           <span>{row.received_date}</span>
           {row.product_group_name && <span>{row.product_group_name}</span>}
-          {row.photo_count > 0 && <span>사진 {row.photo_count}장</span>}
+          {row.photo_count > 0 && <span>사진·영상 {row.photo_count}개</span>}
         </div>
         <p className="case-card-symptom">{row.symptom_head || "증상 내용 없음"}</p>
       </a>
@@ -477,40 +647,45 @@ const KIND_TEXT = {
 };
 const kindTitle = (code, name) => (KIND_TEXT[code] ? KIND_TEXT[code].title : name || code || "");
 
+// fields.symptom = 화면의 '기타 · 추가 증상 설명' 칸. 고른 예시(picks)는 따로 들고 있다가 보낼 때 합친다
 function initialFields(mode, c) {
   const f = { ...EMPTY_FIELDS };
   if (mode === "edit") {
     for (const k of FIELD_KEYS) f[k] = c[k] == null ? "" : String(c[k]);
-    return { fields: f, restored: false };
+    const s = splitSymptom(f.symptom);
+    f.symptom = s.extra;
+    return { fields: f, picks: s.picks, restored: false };
   }
   const draft = readJson("sessionStorage", DRAFT_KEY);
   if (draft && typeof draft === "object") {
     for (const k of FIELD_KEYS) if (typeof draft[k] === "string") f[k] = draft[k];
-    return { fields: f, restored: true };
+    const picks = Array.isArray(draft._picks) ? SYMPTOM_EXAMPLES.filter((s) => draft._picks.includes(s)) : [];
+    return { fields: f, picks, restored: true };
   }
   const rep = readJson("localStorage", REPORTER_KEY) || {};
   if (typeof rep.name === "string") f.reporter_name = rep.name;
   if (typeof rep.phone === "string") f.reporter_phone = rep.phone;
-  return { fields: f, restored: false };
+  return { fields: f, picks: [], restored: false };
 }
 
-const PHOTO_REQUIRED_MSG = "사진을 1장 이상 올려 주세요";
+const PHOTO_REQUIRED_MSG = "사진 또는 영상을 1개 이상 올려 주세요";
 
-function validate(f) {
+function validate(f, picks) {
   if (!f.reporter_name.trim()) return "접수자 이름을 입력해 주세요";
   if (!f.reporter_phone.trim()) return "접수자 연락처를 입력해 주세요";
   if (!f.method) return "접수 구분을 선택해 주세요";
   if (!f.product_group) return "제품군을 선택해 주세요";
   const q = f.qty.trim();
   if (!/^\d+$/.test(q) || Number(q) < 1 || Number(q) > QTY_MAX) return "수량을 확인해 주세요";
-  if (!f.symptom.trim()) return "증상을 입력해 주세요";
+  if (!picks.length && !f.symptom.trim()) return "증상을 고르거나 입력해 주세요";
   return "";
 }
 
-function toPayload(f) {
+function toPayload(f, picks) {
   const p = {};
   for (const k of FIELD_KEYS) p[k] = f[k].trim();
   p.qty = Number(p.qty);
+  p.symptom = composeSymptom(picks, f.symptom);
   return p;
 }
 
@@ -519,14 +694,16 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
   const [init] = useState(() => initialFields(mode, initial));
   const [fields, setFields] = useState(init.fields);
   const [restored, setRestored] = useState(init.restored);
+  const [picks, setPicks] = useState(init.picks); // 고른 증상 예시
+  const [sheetOpen, setSheetOpen] = useState(false);
   const [opts, setOpts] = useState({ loading: true, error: "", groups: [], kinds: [], reporters: [] });
-  const [photos, setPhotos] = useState([]); // [{key, blob, url}] — 접수 때만
+  const [photos, setPhotos] = useState([]); // [{key, kind, blob, url, name}] — 접수 때만 (사진·영상)
   const [preparing, setPreparing] = useState(false);
   const [photoNotes, setPhotoNotes] = useState([]);
   const [photoError, setPhotoError] = useState(""); // 사진을 고르지 않고 접수하려 할 때
   const photoBox = useRef(null);
   const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState(null); // {current, total}
+  const [progress, setProgress] = useState(null); // {label, current, total, pct}
   const [error, setError] = useState("");
   const busyRef = useRef(false);
   const touched = useRef(false);
@@ -558,8 +735,15 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
 
   // 작성 중인 글자 칸은 sessionStorage 에 보관 (로그인이 풀려도 복원)
   useEffect(() => {
-    if (isNew && touched.current) writeStore("sessionStorage", DRAFT_KEY, JSON.stringify(fields));
-  }, [fields, isNew]);
+    if (isNew && touched.current) writeStore("sessionStorage", DRAFT_KEY, JSON.stringify({ ...fields, _picks: picks }));
+  }, [fields, picks, isNew]);
+
+  const choosePicks = (list) => {
+    touched.current = true;
+    setPicks(list);
+    setSheetOpen(false);
+  };
+  const closeSheet = useCallback(() => setSheetOpen(false), []);
 
   const setField = (k, v) => {
     touched.current = true;
@@ -580,6 +764,7 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
       reporter_name: typeof rep.name === "string" ? rep.name : "",
       reporter_phone: typeof rep.phone === "string" ? rep.phone : "",
     });
+    setPicks([]);
     setRestored(false);
   };
 
@@ -589,13 +774,13 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
     if (!files.length) return;
     setPreparing(true);
     setPhotoNotes([]);
-    const { blobs, notes } = await shrinkFiles(files, PHOTO_MAX - photos.length);
+    const { items, notes } = await prepareFiles(files, PHOTO_MAX - countKind(photos, "photo"), VIDEO_MAX - countKind(photos, "video"));
     if (!alive.current) return;
-    const added = blobs.map((blob) => {
-      const url = URL.createObjectURL(blob);
+    const added = items.map((it) => {
+      const url = URL.createObjectURL(it.blob);
       urls.current.add(url);
       photoSeq.current += 1;
-      return { key: photoSeq.current, blob, url };
+      return { ...it, key: photoSeq.current, url };
     });
     setPhotos((p) => p.concat(added));
     if (added.length) setPhotoError("");
@@ -615,9 +800,10 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
   const submit = async (e) => {
     e.preventDefault();
     if (busyRef.current) return; // 연타 막기 (다시 그리기 전에 들어온 두 번째 누름까지)
-    const msg = validate(fields);
+    const msg = validate(fields, picks);
     if (msg) { setError(msg); return; }
-    // 2026-11-19: 접수에는 사진이 1장 이상 있어야 한다 (수정 화면에는 걸지 않는다 — 사진은 상세에서 따로 관리)
+    // 2026-11-19: 접수에는 사진이 1장 이상 있어야 한다 → 2026-11-24: 사진·영상 중 1개 이상
+    // (수정 화면에는 걸지 않는다 — 사진·영상은 상세에서 따로 관리)
     if (isNew && photos.length === 0) {
       setError("");
       setPhotoError(PHOTO_REQUIRED_MSG);
@@ -627,7 +813,7 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
     busyRef.current = true;
     setBusy(true);
     setError("");
-    const payload = toPayload(fields);
+    const payload = toPayload(fields, picks);
     let saved;
     try {
       if (isNew) saved = await api("/cases", { method: "POST", body: { ...payload, client_key: clientKey.current } });
@@ -651,23 +837,14 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
     const finish = (failed) => {
       if (parseHash().name !== "new") return;
       const items = [{ kind: "ok", text: `접수되었습니다. 접수번호 ${saved.as_no}` }];
-      if (failed) items.push({ kind: "warn", text: `사진 ${failed}장을 올리지 못했습니다 — 상세 화면에서 다시 올려 주세요` });
+      if (failed) items.push({ kind: "warn", text: `사진·영상 ${failed}개를 올리지 못했습니다 — 상세 화면에서 다시 올려 주세요` });
       setFlash(`case:${saved.id}`, items);
       go(`#/case/${saved.id}`, true); // 뒤로 가기가 빈 접수 화면으로 돌아가지 않게
     };
 
-    // 건이 만들어진 뒤 사진을 한 장씩
-    let failed = 0;
-    for (let i = 0; i < photos.length; i++) {
-      setProgress({ current: i + 1, total: photos.length });
-      try {
-        await uploadPhoto(saved.id, photos[i].blob, i + 1);
-      } catch (err) {
-        if (err.status === 401) { finish(failed + photos.length - i); return; } // 로그인 화면으로 바뀐다
-        failed += 1;
-      }
-    }
-    finish(failed);
+    // 건이 만들어진 뒤 사진·영상을 하나씩 (401 이면 로그인 화면으로 바뀐다)
+    const r = await uploadAll(saved.id, photos, 0, setProgress);
+    finish(r.failed);
   };
 
   // 수정 화면에서 지금은 쓰지 않는 제품군이 걸려 있으면 그대로 보이게
@@ -758,13 +935,27 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
               onChange={(e) => setField("model_text", e.target.value)} aria-describedby="f-model-hint" />
             <p className="field-hint" id="f-model-hint">제품 뒷면 라벨에 적힌 내용을 알려 주시면 더 빨리 확인할 수 있습니다.</p>
           </div>
+          {/* 2026-11-24: 증상은 예시에서 고르고(여러 개), 없거나 더 적을 내용은 아래 칸에. 둘 중 하나는 있어야 접수된다 */}
           <div className="field">
-            <label htmlFor="f-symptom">증상 <span className="req">(필수)</span></label>
-            <textarea id="f-symptom" rows={5} value={fields.symptom} maxLength={4000}
-              placeholder="예) 전원은 들어오는데 화면이 나오지 않습니다. 어제 오후부터 그렇습니다."
+            <span className="field-label" id="f-symptom-label">증상 <span className="req">(필수)</span></span>
+            <button type="button" className={"picker" + (picks.length ? " has" : "")} onClick={() => setSheetOpen(true)}
+              aria-haspopup="dialog" aria-labelledby="f-symptom-label f-symptom-value">
+              <span id="f-symptom-value" className="picker-value">
+                {picks.length
+                  ? <ul className="picker-list">{picks.map((p) => <li key={p}>{p}</li>)}</ul>
+                  : <span className="picker-placeholder">자주 있는 증상에서 고르기</span>}
+              </span>
+              <span className="picker-mark" aria-hidden="true">{picks.length ? "변경" : ""}</span>
+            </button>
+          </div>
+          <div className="field">
+            <label htmlFor="f-symptom">기타 · 추가 증상 설명</label>
+            <textarea id="f-symptom" rows={4} value={fields.symptom} maxLength={3600}
+              placeholder="예) 어제 오후부터 그렇습니다. 위 목록에 없는 증상은 여기에 적어 주세요."
               onChange={(e) => setField("symptom", e.target.value)} />
           </div>
         </div>
+        {sheetOpen && <SymptomSheet selected={picks} onDone={choosePicks} onClose={closeSheet} />}
 
         <div className="card form">
           {/* 2026-11-19: "(선택)" 글자를 빼고 처음부터 펼쳐 둔다 — 한 번 더 누르지 않게. 비워도 접수된다 */}
@@ -790,33 +981,39 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
 
         {isNew && (
           <div className={"card form" + (photoError ? " card-invalid" : "")} ref={photoBox}>
-            <h2 className="section-title">사진 <span className="req">(필수)</span> <span className="opt">({photos.length}/{PHOTO_MAX})</span></h2>
-            <p className="field-hint">고장 부위와 제품 라벨이 보이게 찍어 주세요. 1장 이상 올려야 접수됩니다.</p>
+            <h2 className="section-title">사진·영상 <span className="req">(필수)</span>{" "}
+              <span className="opt">(사진 {countKind(photos, "photo")}/{PHOTO_MAX} · 영상 {countKind(photos, "video")}/{VIDEO_MAX})</span></h2>
+            <p className="field-hint">고장 부위와 제품 라벨이 보이게 찍어 주세요. 사진 또는 영상을 1개 이상 올려야 접수됩니다.
+              깜박임·소리처럼 움직임이 있는 증상은 영상으로 찍어 주시면 좋습니다.</p>
             {photoError && <Banner kind="error">{photoError}</Banner>}
             <Messages items={photoNotes} />
             {photos.length > 0 && (
               <ul className="thumbs">
                 {photos.map((p, i) => (
                   <li key={p.key} className="thumb">
-                    <img src={p.url} alt={`고른 사진 ${i + 1}`} />
-                    <button type="button" className="thumb-remove" onClick={() => removePhoto(p.key)} aria-label={`사진 ${i + 1} 빼기`}>
+                    {p.kind === "video"
+                      ? <div className="thumb-video"><video src={`${p.url}#t=0.1`} muted playsInline preload="metadata" aria-label={`고른 영상 ${i + 1}`} /><span className="thumb-badge">▶ 영상</span></div>
+                      : <img src={p.url} alt={`고른 사진 ${i + 1}`} />}
+                    <button type="button" className="thumb-remove" onClick={() => removePhoto(p.key)}
+                      aria-label={`${p.kind === "video" ? "영상" : "사진"} ${i + 1} 빼기`}>
                       빼기
                     </button>
                   </li>
                 ))}
               </ul>
             )}
-            <label htmlFor="f-photos" className="sr-only">사진 파일 고르기</label>
-            <input id="f-photos" ref={fileRef} type="file" accept="image/*" multiple className="sr-only" tabIndex={-1} onChange={onPick} />
-            <button type="button" className="btn btn-photo btn-block" disabled={preparing || photos.length >= PHOTO_MAX}
+            <label htmlFor="f-photos" className="sr-only">사진·영상 파일 고르기</label>
+            <input id="f-photos" ref={fileRef} type="file" accept="image/*,video/*" multiple className="sr-only" tabIndex={-1} onChange={onPick} />
+            <button type="button" className="btn btn-photo btn-block"
+              disabled={preparing || (countKind(photos, "photo") >= PHOTO_MAX && countKind(photos, "video") >= VIDEO_MAX)}
               onClick={() => fileRef.current && fileRef.current.click()}>
-              {preparing ? <><Spinner /> 사진 준비하는 중…</> : photos.length >= PHOTO_MAX ? `사진은 ${PHOTO_MAX}장까지입니다` : <><span className="btn-photo-mark" aria-hidden="true">＋</span> 사진 찍기 / 고르기</>}
+              {preparing ? <><Spinner /> 준비하는 중…</> : <><span className="btn-photo-mark" aria-hidden="true">＋</span> 사진·영상 찍기 / 고르기</>}
             </button>
           </div>
         )}
 
         {error && <Banner kind="error">{error}</Banner>}
-        {progress && busy && <Progress current={progress.current} total={progress.total} label="사진 올리는 중" />}
+        {progress && busy && <UploadProgress up={progress} />}
         <div className="actions">
           <button type="submit" className="btn btn-primary btn-lg" disabled={formBusy}>
             {busy
@@ -841,6 +1038,38 @@ function NewScreen() {
 }
 
 // ---- 상세 ----
+
+// 영상은 목록에서 미리 받지 않는다(크다) — 누르면 그때 받아 재생 창을 연다
+function VideoThumb({ photoId, index, onOpen, onRemove, removing }) {
+  const [st, setSt] = useState("idle"); // idle | loading | missing | error
+  const live = useRef(true);
+  useEffect(() => () => { live.current = false; }, []);
+  const open = () => {
+    if (st === "loading") return;
+    setSt("loading");
+    api(`/photos/${photoId}`, { blob: true }).then((b) => {
+      if (!live.current) return;
+      setSt("idle");
+      onOpen(URL.createObjectURL(b), index, "video");
+    }).catch((e) => {
+      if (live.current) setSt(e.status === 404 ? "missing" : "error");
+    });
+  };
+  return (
+    <li className="thumb">
+      <button type="button" className="thumb-open thumb-video-tile" onClick={open} aria-label={`영상 ${index + 1} 재생`}>
+        {st === "loading" ? <Spinner /> : <span className="thumb-play" aria-hidden="true">▶</span>}
+        <span className="thumb-video-text">
+          {st === "missing" ? "영상 없음 — 새로 고침" : st === "error" ? "불러오지 못함 — 다시 누르기" : st === "loading" ? "불러오는 중…" : "영상 보기"}
+        </span>
+      </button>
+      {onRemove && (
+        <button type="button" className="thumb-remove" disabled={removing} onClick={() => onRemove(photoId)}
+          aria-label={`영상 ${index + 1} 지우기`}>지우기</button>
+      )}
+    </li>
+  );
+}
 
 function PhotoThumb({ photoId, index, onOpen, onRemove, removing }) {
   const [st, setSt] = useState({ state: "loading", url: "" });
@@ -880,7 +1109,7 @@ function PhotoThumb({ photoId, index, onOpen, onRemove, removing }) {
   );
 }
 
-function PhotoViewer({ url, index, total, onClose }) {
+function PhotoViewer({ url, index, total, kind, onClose }) {
   const closeRef = useRef(null);
   useEffect(() => {
     const prev = document.activeElement;
@@ -896,13 +1125,15 @@ function PhotoViewer({ url, index, total, onClose }) {
   }, [onClose]);
 
   return (
-    <div className="viewer" role="dialog" aria-modal="true" aria-label={`사진 ${index + 1} / ${total}`}
+    <div className="viewer" role="dialog" aria-modal="true" aria-label={`${kind === "video" ? "영상" : "사진"} ${index + 1} / ${total}`}
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="viewer-bar">
         <span className="viewer-count">{index + 1} / {total}</span>
         <button ref={closeRef} type="button" className="btn viewer-close" onClick={onClose}>닫기</button>
       </div>
-      <img className="viewer-img" src={url} alt={`사진 ${index + 1}`} />
+      {kind === "video"
+        ? <video className="viewer-img viewer-video" src={url} controls autoPlay playsInline />
+        : <img className="viewer-img" src={url} alt={`사진 ${index + 1}`} />}
     </div>
   );
 }
@@ -944,7 +1175,11 @@ function CaseScreen({ id }) {
   }, [id]);
   useEffect(() => { reload(false); }, [reload]);
 
-  const closeViewer = useCallback(() => setViewer(null), []);
+  // 영상 창의 blob 주소는 창을 닫을 때 돌려준다 (사진 주소는 미리 보기 칸이 주인)
+  const closeViewer = useCallback(() => setViewer((v) => {
+    if (v && v.kind === "video") URL.revokeObjectURL(v.url);
+    return null;
+  }), []);
 
   const begin = (what) => {
     if (busyRef.current) return false;
@@ -974,26 +1209,21 @@ function CaseScreen({ id }) {
     if (!files.length || !c) return;
     if (!begin("photo")) return;
     setMsgs([]);
-    const startCount = c.photos.length;
-    setUpload({ label: "사진 준비하는 중", current: 1, total: Math.min(files.length, PHOTO_MAX - startCount) });
-    const { blobs, notes } = await shrinkFiles(files, PHOTO_MAX - startCount);
-    let failed = 0;
-    let lastErr = "";
-    for (let i = 0; i < blobs.length; i++) {
-      setUpload({ label: "사진 올리는 중", current: i + 1, total: blobs.length });
-      try {
-        await uploadPhoto(id, blobs[i], startCount + i + 1);
-      } catch (err) {
-        if (err.status === 401) return; // 로그인 화면으로 바뀐다
-        failed += 1;
-        lastErr = err.message;
-      }
-    }
+    const have = c.photos || [];
+    const startCount = have.length;
+    setUpload({ label: "준비하는 중", current: 1, total: files.length, pct: null });
+    const { items, notes } = await prepareFiles(files, PHOTO_MAX - countKind(have, "photo"), VIDEO_MAX - countKind(have, "video"));
+    const r = await uploadAll(id, items, startCount, setUpload);
+    if (r.stopped) return; // 로그인 화면으로 바뀐다
+    const { failed, lastErr } = r;
     setUpload(null);
     const out = notes.slice();
-    const ok = blobs.length - failed;
-    if (ok > 0) out.unshift({ kind: "ok", text: `사진 ${ok}장을 올렸습니다` });
-    if (failed) out.push({ kind: "warn", text: `사진 ${failed}장을 올리지 못했습니다 — ${lastErr}` });
+    const ok = items.length - failed;
+    if (ok > 0) out.unshift({ kind: "ok", text: `${ok}개를 올렸습니다` });
+    if (ok > 0 && items.some((x) => x.kind === "video")) {
+      out.push({ kind: "info", text: "영상은 저장 뒤 몇 분 동안 화질을 줄이는 작업을 합니다. 그동안 영상이 안 보이면 잠시 뒤 새로 고쳐 주세요" });
+    }
+    if (failed) out.push({ kind: "warn", text: `${failed}개를 올리지 못했습니다 — ${lastErr}` });
     setMsgs(out);
     await reload(true);
     end();
@@ -1001,16 +1231,19 @@ function CaseScreen({ id }) {
 
   const removePhoto = async (pid) => {
     // 2026-11-19: 접수에는 사진이 1장 이상 있어야 한다 → 마지막 한 장은 지우지 못한다 (다른 사진을 먼저 올리면 지울 수 있다)
+    // 2026-11-24: 사진·영상을 합쳐 1개 이상
     if ((c.photos || []).length <= 1) {
-      setMsgs([{ kind: "warn", text: "사진은 1장 이상 있어야 합니다. 다른 사진을 먼저 올린 뒤 지워 주세요" }]);
+      setMsgs([{ kind: "warn", text: "사진·영상은 1개 이상 있어야 합니다. 다른 사진이나 영상을 먼저 올린 뒤 지워 주세요" }]);
       return;
     }
-    if (!window.confirm("이 사진을 지울까요?")) return;
+    const target = (c.photos || []).find((p) => p.id === pid);
+    const what = target && target.kind === "video" ? "영상" : "사진";
+    if (!window.confirm(`이 ${what}을 지울까요?`)) return;
     if (!begin("remove")) return;
     try {
       await api(`/cases/${id}/photos/${pid}`, { method: "DELETE" });
-      setViewer(null);
-      setMsgs([{ kind: "ok", text: "사진을 지웠습니다" }]);
+      closeViewer();
+      setMsgs([{ kind: "ok", text: `${what}을 지웠습니다` }]);
     } catch (e) {
       setMsgs([{ kind: "error", text: e.message }]);
     }
@@ -1083,25 +1316,30 @@ function CaseScreen({ id }) {
       )}
 
       <div className="card">
-        <h2 className="section-title">사진 <span className="opt">({photos.length}장)</span></h2>
-        {photos.length === 0 && <p className="muted">올린 사진이 없습니다.</p>}
+        <h2 className="section-title">사진·영상{" "}
+          <span className="opt">(사진 {countKind(photos, "photo")}장 · 영상 {countKind(photos, "video")}개)</span></h2>
+        {photos.length === 0 && <p className="muted">올린 사진·영상이 없습니다.</p>}
         {photos.length > 0 && (
           <ul className="thumbs">
-            {photos.map((p, i) => (
-              <PhotoThumb key={p.id} photoId={p.id} index={i}
-                onOpen={(url, index) => setViewer({ url, index })}
-                onRemove={editing && c.can_edit ? removePhoto : null} removing={anyBusy} />
-            ))}
+            {photos.map((p, i) => {
+              const Thumb = p.kind === "video" ? VideoThumb : PhotoThumb;
+              return (
+                <Thumb key={p.id} photoId={p.id} index={i}
+                  onOpen={(url, index, kind) => setViewer({ url, index, kind: kind || "photo" })}
+                  onRemove={editing && c.can_edit ? removePhoto : null} removing={anyBusy} />
+              );
+            })}
           </ul>
         )}
-        {upload && <Progress current={upload.current} total={upload.total} label={upload.label} />}
+        {upload && <UploadProgress up={upload} />}
         {c.can_add_photo && !editing && (
           <>
-            <label htmlFor="d-photos" className="sr-only">사진 파일 고르기</label>
-            <input id="d-photos" ref={fileRef} type="file" accept="image/*" multiple className="sr-only" tabIndex={-1} onChange={onPick} />
-            <button type="button" className="btn btn-secondary btn-block" disabled={anyBusy || photos.length >= PHOTO_MAX}
+            <label htmlFor="d-photos" className="sr-only">사진·영상 파일 고르기</label>
+            <input id="d-photos" ref={fileRef} type="file" accept="image/*,video/*" multiple className="sr-only" tabIndex={-1} onChange={onPick} />
+            <button type="button" className="btn btn-secondary btn-block"
+              disabled={anyBusy || (countKind(photos, "photo") >= PHOTO_MAX && countKind(photos, "video") >= VIDEO_MAX)}
               onClick={() => fileRef.current && fileRef.current.click()}>
-              {busy === "photo" ? <><Spinner /> 사진 올리는 중…</> : photos.length >= PHOTO_MAX ? `사진은 ${PHOTO_MAX}장까지입니다` : "사진 추가"}
+              {busy === "photo" ? <><Spinner /> 올리는 중…</> : "사진·영상 추가"}
             </button>
           </>
         )}
@@ -1119,7 +1357,7 @@ function CaseScreen({ id }) {
         <p className="hint">담당자가 확인한 접수는 직접 수정할 수 없습니다. 변경할 내용은 담당자에게 문의해 주세요.</p>
       )}
 
-      {viewer && <PhotoViewer url={viewer.url} index={viewer.index} total={photos.length} onClose={closeViewer} />}
+      {viewer && <PhotoViewer url={viewer.url} index={viewer.index} total={photos.length} kind={viewer.kind} onClose={closeViewer} />}
     </section>
   );
 }

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..models import AsCase, AsCaseLog, AsCasePhoto, AsPortalAccount, CommonCode, CommonCodeGroup, RecordRevision
 from ..services import photo as as_photo
+from ..services import video as as_video
 from ..services.case_rules import (
     REV_SCOPE, SYMPTOM_MAX, check_text_lengths, code_names, customer_can_add_photo, customer_can_edit,
     portal_view, today_kst,
@@ -351,10 +352,40 @@ def upload_photo(case_id: int, file: UploadFile = File(...), db: Session = Depen
     c = _get_case(db, account, case_id)
     if not customer_can_add_photo(c.status):
         raise HTTPException(409, "사진을 더 올릴 수 없는 접수입니다")
-    data = file.file.read(as_photo.MAX_BYTES + 1)
-    p = as_photo.save_photo(db, c, data, file.filename or "", "customer", f"고객:{c.reporter_name or ''}"[:60])
-    db.commit()
-    return {"id": p.id, "orig_name": p.orig_name}
+    by_name = f"고객:{c.reporter_name or ''}"[:60]
+    head = file.file.read(16)
+    file.file.seek(0)
+    if as_photo.sniff_image(head):
+        data = file.file.read(as_photo.MAX_BYTES + 1)
+        p = as_photo.save_photo(db, c, data, file.filename or "", "customer", by_name)
+        db.commit()
+        return {"id": p.id, "orig_name": p.orig_name, "kind": "photo"}
+    if not as_video.sniff_video(head):
+        raise HTTPException(400, as_video.NOT_VIDEO)
+    # 영상: 서버 작업 폴더로 받아(한도를 넘으면 그 자리에서 멈춘다) 원본을 저장하고, FHD 변환은 뒤에서 한다
+    work = as_video.work_file()
+    try:
+        total = 0
+        with open(work, "wb") as out:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > as_video.VIDEO_MAX_BYTES:
+                    raise HTTPException(400, as_video.too_big_message())
+                out.write(chunk)
+        p = as_video.store_original(db, c, work, file.filename or "", "customer", by_name)
+        db.commit()
+    except BaseException:
+        db.rollback()
+        try:
+            work.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    as_video.schedule(p.id, work)
+    return {"id": p.id, "orig_name": p.orig_name, "kind": "video"}
 
 
 def _customer_photo(db: Session, c: AsCase, pid: int) -> AsCasePhoto:

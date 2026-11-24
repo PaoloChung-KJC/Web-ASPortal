@@ -62,8 +62,10 @@ def portal_view(case, photos):
     view["status_label"] = CUSTOMER_STATUS_LABEL[cs]
     view["can_edit"] = customer_can_edit(status)
     view["can_add_photo"] = customer_can_add_photo(status)
+    # kind: photo / video (2026-11-24 영상 추가)
     view["photos"] = [
-        {"id": p.id, "orig_name": p.orig_name}
+        {"id": p.id, "orig_name": p.orig_name,
+         "kind": "video" if str(getattr(p, "content_type", "") or "").startswith("video/") else "photo"}
         for p in photos
         if getattr(p, "uploaded_by", None) == "customer"
     ]

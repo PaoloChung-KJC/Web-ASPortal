@@ -47,7 +47,7 @@ class CaseRulesTest(unittest.TestCase):
             self.assertNotIn(k, v)
         self.assertEqual((v["status"], v["status_label"], v["can_edit"], v["can_add_photo"]),
                          ("progress", "처리 중", False, True))
-        self.assertEqual(v["photos"], [{"id": 1, "orig_name": "a.jpg"}])
+        self.assertEqual(v["photos"], [{"id": 1, "orig_name": "a.jpg", "kind": "photo"}])
         for f in PORTAL_FIELDS:
             self.assertIn(f, v)
 

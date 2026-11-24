@@ -23,7 +23,11 @@ class DeployFilesTest(unittest.TestCase):
         # uvicorn 이 X-Forwarded-For 를 먼저 풀어 버리면 client_ip.py 의 규칙(마지막 값·포트 떼기)을 거치지 않는다
         self.assertIn("--no-proxy-headers", args)
         self.assertNotIn("--reload", args)
-        self.assertEqual(root.find(".//requestLimits").get("maxAllowedContentLength"), "10485760")
+        # 2026-11-24: 영상 원본 1GB(VIDEO_MAX_MB 기본) + 여유 — 전에는 사진만 10MB
+        self.assertEqual(root.find(".//requestLimits").get("maxAllowedContentLength"), "1090519040")
+        self.assertEqual(hp.get("requestTimeout"), "00:30:00")
+        env = {e.get("name"): e.get("value") for e in hp.findall(".//environmentVariable")}
+        self.assertEqual(env.get("TEMP"), env.get("TMP"))   # 큰 업로드 임시 파일 · 영상 작업 폴더
 
     def test_web_config_hides_program_folders(self):
         root = ET.parse(DEPLOY / "web.config").getroot()

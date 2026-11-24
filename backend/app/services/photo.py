@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException
+from sqlalchemy import or_
 
 from ..config import AS_UPLOAD_DIR  # 테스트에서 이 모듈의 AS_UPLOAD_DIR 을 바꿔 쓴다
 from ..models import AsCasePhoto
@@ -18,6 +19,11 @@ MAX_BYTES = 8 * 1024 * 1024
 CUSTOMER_MAX = 10
 _LIMITS = {"customer": CUSTOMER_MAX}
 STORAGE_DOWN = "사진을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요"
+
+
+def photo_only(query):
+    """사진 한도를 셀 때 영상을 빼는 조건 (content_type 이 비어 있던 옛 행은 사진으로 센다)."""
+    return query.filter(or_(AsCasePhoto.content_type.is_(None), ~AsCasePhoto.content_type.like("video/%")))
 
 
 def sniff_image(data: bytes):
@@ -42,7 +48,8 @@ def save_photo(db, case, data: bytes, orig_name: str, by: str, by_name: str) -> 
     if len(data) > MAX_BYTES:
         raise HTTPException(400, "사진 한 장은 8MB 이하여야 합니다")
     limit = _LIMITS[by]
-    count = db.query(AsCasePhoto).filter(AsCasePhoto.case_id == case.id, AsCasePhoto.uploaded_by == by).count()
+    # 영상(2026-11-24)은 따로 센다 — 사진 한도는 사진끼리만
+    count = photo_only(db.query(AsCasePhoto).filter(AsCasePhoto.case_id == case.id, AsCasePhoto.uploaded_by == by)).count()
     if count >= limit:
         raise HTTPException(400, f"사진은 최대 {limit}장까지 올릴 수 있습니다")
     content_type, ext = kind

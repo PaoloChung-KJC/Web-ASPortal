@@ -4,6 +4,8 @@
 웹 서버(운영): backend/.env 의 DATABASE_URL 로 NAS PostgreSQL 에 접속
 """
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -32,6 +34,14 @@ SECRET_KEY_IS_DEFAULT = SECRET_KEY == DEFAULT_SECRET_KEY
 
 # 사진 폴더. 운영은 NAS 공유 폴더(UNC 경로) — crm-rma 가 /data/uploads/as 로 보는 바로 그 폴더
 AS_UPLOAD_DIR = Path(os.getenv("AS_UPLOAD_DIR") or (BASE_DIR / "uploads" / "as"))
+
+# 영상 — 고객이 올린 영상은 서버에서 ffmpeg 로 FHD MP4 로 바꿔 저장한다(원본은 지운다).
+# ffmpeg 가 없거나 변환에 실패하면 원본을 그대로 둔다(접수 증거가 없어지지 않게)
+FFMPEG_PATH = (os.getenv("FFMPEG_PATH") or "").strip() or shutil.which("ffmpeg") or ""
+VIDEO_MAX_BYTES = int(os.getenv("VIDEO_MAX_MB") or 1024) * 1024 * 1024   # 원본 한 개 한도
+VIDEO_TIMEOUT_SEC = int(os.getenv("VIDEO_TIMEOUT_SEC") or 3600)        # 한 개 변환 시간 한도
+# 올라온 원본·변환 결과를 잠시 두는 서버 안 폴더(NAS 아님 — 변환이 빠르게)
+VIDEO_WORK_DIR = Path(os.getenv("VIDEO_WORK_DIR") or (Path(tempfile.gettempdir()) / "asportal-video"))
 
 # 요청자 IP 머리말(X-Forwarded-For)을 믿어도 되는 상대 = 같은 서버의 IIS
 TRUSTED_PROXIES = frozenset(
