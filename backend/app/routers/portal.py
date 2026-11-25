@@ -39,8 +39,8 @@ PRODUCT_GROUP = "AS_PRODUCT_GROUP"
 KIND_GROUP = "AS_KIND"   # 접수 구분: CS(현장) / AS(입고 수리) — 직원 화면의 '구분'(as_case.method)과 같은 칸
 
 # 고객이 고칠 수 있는 글자 칸 (길이 검사 대상)
-_TEXT_FIELDS = ("reporter_name", "reporter_phone", "model_text", "site_name", "site_address", "site_phone")
-_OPTIONAL_TEXT = ("model_text", "site_name", "site_address", "site_phone")
+_TEXT_FIELDS = ("reporter_name", "reporter_phone", "model_text", "site_name", "site_address", "site_address_detail", "site_phone")
+_OPTIONAL_TEXT = ("model_text", "site_name", "site_address", "site_address_detail", "site_phone")
 _FILTERS = {"all": None, "progress": ("received", "open", "hold"), "done": ("done", "closed")}
 
 

@@ -20,12 +20,12 @@ CUSTOMER_STATUS_LABEL = {"received": "접수됨", "progress": "처리 중", "don
 # method = 접수 구분(공통코드 AS_KIND: CS 현장 / AS 입고 수리). 2026-11-19 부터 고객이 접수할 때 직접 고른다
 PORTAL_FIELDS = (
     "id", "as_no", "received_date", "reporter_name", "reporter_phone", "method", "product_group",
-    "model_text", "qty", "symptom", "site_name", "site_address", "site_phone", "customer_notice",
+    "model_text", "qty", "symptom", "site_name", "site_address", "site_address_detail", "site_phone", "customer_notice",
 )
 
 FIELD_LABELS = {
     "reporter_name": "접수자", "reporter_phone": "접수자 연락처", "model_text": "모델명",
-    "site_name": "장소", "site_address": "장소(주소)", "site_phone": "장소 연락처",
+    "site_name": "장소", "site_address": "장소(주소)", "site_address_detail": "장소(상세주소)", "site_phone": "장소 연락처",
 }
 
 _KST = timezone(timedelta(hours=9))

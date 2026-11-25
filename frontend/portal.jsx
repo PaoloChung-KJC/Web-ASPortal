@@ -255,6 +255,84 @@ async function uploadAll(caseId, items, startN, setUpload) {
   return { failed, lastErr, stopped: false };
 }
 
+// ---- 주소 검색 (카카오 우편번호 서비스 — CRM 과 같은 것. 키가 필요 없다) ----
+// 폰에서는 팝업이 새 탭으로 열려 불편하므로 화면 안 창에 끼워 넣는다(embed)
+
+const POSTCODE_SRC = "https://t1.kakaocdn.net/mapjsapi/bundle/postcode/prod/postcode.v2.js";
+let postcodeLoading = null;
+
+function loadPostcode() {
+  const ready = () => (window.kakao && window.kakao.Postcode) || (window.daum && window.daum.Postcode);
+  if (ready()) return Promise.resolve(ready());
+  if (!postcodeLoading) {
+    postcodeLoading = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = POSTCODE_SRC;
+      s.async = true;
+      const timer = setTimeout(() => reject(new Error("timeout")), 10000);
+      s.onload = () => { clearTimeout(timer); const P = ready(); if (P) resolve(P); else reject(new Error("no postcode")); };
+      s.onerror = () => { clearTimeout(timer); reject(new Error("load")); };
+      document.head.appendChild(s);
+    }).catch((e) => { postcodeLoading = null; throw e; }); // 실패하면 다음에 다시 시도
+  }
+  return postcodeLoading;
+}
+
+// 도로명/지번 + (동, 아파트 이름) — CRM 의 openKoreanAddressSearch 와 같은 규칙
+function postcodeAddress(data) {
+  const addr = data.userSelectedType === "R" ? data.roadAddress : data.jibunAddress;
+  const extra = data.userSelectedType === "R"
+    ? [/[동로가]$/.test(data.bname || "") ? data.bname : "", data.apartment === "Y" ? data.buildingName : ""].filter(Boolean).join(", ")
+    : "";
+  return extra ? `${addr} (${extra})` : addr;
+}
+
+function AddressSheet({ onPick, onClose }) {
+  const boxRef = useRef(null);
+  const holderRef = useRef(null);
+  const [state, setState] = useState("loading"); // loading | ready | error
+  useEffect(() => {
+    const prev = document.activeElement;
+    if (boxRef.current) boxRef.current.focus();
+    const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); onClose(); } };
+    document.addEventListener("keydown", onKey);
+    document.body.classList.add("no-scroll");
+    let live = true;
+    loadPostcode().then((Postcode) => {
+      if (!live || !holderRef.current) return;
+      new Postcode({
+        oncomplete: (data) => { if (live) onPick(postcodeAddress(data)); },
+        width: "100%",
+        height: "100%",
+      }).embed(holderRef.current, { autoClose: false });
+      setState("ready");
+    }).catch(() => { if (live) setState("error"); });
+    return () => {
+      live = false;
+      document.removeEventListener("keydown", onKey);
+      document.body.classList.remove("no-scroll");
+      if (prev && prev.focus) prev.focus();
+    };
+  }, [onPick, onClose]);
+  return (
+    <div className="sheet-wrap" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="sheet sheet-addr" role="dialog" aria-modal="true" aria-labelledby="addr-title" tabIndex={-1} ref={boxRef}>
+        <div className="sheet-head">
+          <h2 className="sheet-title" id="addr-title">주소 검색</h2>
+          <button type="button" className="sheet-close" onClick={onClose} aria-label="닫기">✕</button>
+        </div>
+        {state === "loading" && <p className="sheet-hint addr-msg"><Spinner /> 주소 검색을 여는 중…</p>}
+        {state === "error" && (
+          <div className="addr-msg">
+            <Banner kind="warn">주소 검색을 열지 못했습니다. 창을 닫고 주소 칸에 직접 입력해 주세요.</Banner>
+          </div>
+        )}
+        <div className="addr-holder" ref={holderRef} hidden={state === "error"} />
+      </div>
+    </div>
+  );
+}
+
 // ---- 증상 고르기 (아래에서 올라오는 선택 창 — 폰. PC·태블릿은 가운데 창) ----
 
 function SymptomSheet({ selected, onDone, onClose }) {
@@ -636,10 +714,10 @@ function ListScreen({ filter, setFilter }) {
 // method = 접수 구분(현장 / 입고 수리). 처음에는 비워 두고 고객이 반드시 고른다
 const EMPTY_FIELDS = {
   reporter_name: "", reporter_phone: "", method: "", product_group: "", qty: "1", model_text: "",
-  symptom: "", site_name: "", site_address: "", site_phone: "",
+  symptom: "", site_name: "", site_address: "", site_address_detail: "", site_phone: "",
 };
 const FIELD_KEYS = Object.keys(EMPTY_FIELDS);
-const SITE_KEYS = ["site_name", "site_address", "site_phone"];
+const SITE_KEYS = ["site_name", "site_address", "site_address_detail", "site_phone"];
 // 접수 구분을 고객이 알아보기 쉬운 말로 (공통코드 AS_KIND 의 code 기준. 모르는 code 는 서버가 준 이름 그대로)
 const KIND_TEXT = {
   CS: { title: "현장 수리", desc: "설치된 곳으로 방문해 수리합니다" },
@@ -737,6 +815,17 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
   useEffect(() => {
     if (isNew && touched.current) writeStore("sessionStorage", DRAFT_KEY, JSON.stringify({ ...fields, _picks: picks }));
   }, [fields, picks, isNew]);
+
+  // 주소 검색: 고르면 주소 칸에 넣고 상세주소 칸으로 바로 넘어간다 (CRM 화면들과 같은 동작)
+  const [addrOpen, setAddrOpen] = useState(false);
+  const detailRef = useRef(null);
+  const closeAddr = useCallback(() => setAddrOpen(false), []);
+  const pickAddress = useCallback((addr) => {
+    touched.current = true;
+    setFields((f) => ({ ...f, site_address: addr.slice(0, 255) }));
+    setAddrOpen(false);
+    setTimeout(() => { if (detailRef.current) detailRef.current.focus(); }, 50);
+  }, []);
 
   const choosePicks = (list) => {
     touched.current = true;
@@ -956,6 +1045,7 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
           </div>
         </div>
         {sheetOpen && <SymptomSheet selected={picks} onDone={choosePicks} onClose={closeSheet} />}
+        {addrOpen && <AddressSheet onPick={pickAddress} onClose={closeAddr} />}
 
         <div className="card form">
           {/* 2026-11-19: "(선택)" 글자를 빼고 처음부터 펼쳐 둔다 — 한 번 더 누르지 않게. 비워도 접수된다 */}
@@ -967,9 +1057,18 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
                 onChange={(e) => setField("site_name", e.target.value)} />
             </div>
             <div className="field">
+              {/* 2026-11-24: CRM 표준과 같은 '주소(카카오 검색) + 상세주소' 두 칸. 직원 화면에도 두 칸으로 보인다. 직접 입력도 된다 */}
               <label htmlFor="f-site-addr">주소</label>
-              <input id="f-site-addr" type="text" value={fields.site_address} maxLength={255} autoComplete="street-address"
-                onChange={(e) => setField("site_address", e.target.value)} />
+              <div className="addr-row">
+                <input id="f-site-addr" type="text" value={fields.site_address} maxLength={255} autoComplete="street-address"
+                  placeholder="주소 검색을 누르세요" onChange={(e) => setField("site_address", e.target.value)} />
+                <button type="button" className="btn btn-secondary addr-btn" onClick={() => setAddrOpen(true)}>주소 검색</button>
+              </div>
+            </div>
+            <div className="field">
+              <label htmlFor="f-site-addr-detail">상세주소</label>
+              <input id="f-site-addr-detail" ref={detailRef} type="text" value={fields.site_address_detail} maxLength={200}
+                placeholder="동·층·호수 등" onChange={(e) => setField("site_address_detail", e.target.value)} />
             </div>
             <div className="field">
               <label htmlFor="f-site-phone">현장 연락처</label>
@@ -1310,6 +1409,7 @@ function CaseScreen({ id }) {
             <InfoRow label="증상" value={c.symptom} multiline />
             {site && <InfoRow label="매장명" value={c.site_name} />}
             {site && <InfoRow label="주소" value={c.site_address} />}
+            {site && <InfoRow label="상세주소" value={c.site_address_detail} />}
             {site && <InfoRow label="현장 연락처" value={c.site_phone} />}
           </dl>
         </div>

@@ -138,6 +138,18 @@ class PortalApiTest(unittest.TestCase):
         return self.client.post(f"/api/portal/cases/{cid}/photos", headers=self.h(tok),
                                 files={"file": ("a.jpg", data, "image/jpeg")})
 
+    # ---- 설치 장소 주소 + 상세주소 (2026-11-24, CRM 표준과 같은 두 칸) ----
+    def test_site_address_detail_saved_and_shown(self):
+        c = self.create(site_address="경기 성남시 분당구 판교역로 166 (백현동)", site_address_detail=" 3층 301호 ")
+        self.assertEqual(c["site_address_detail"], "3층 301호")
+        self.assertEqual(self.db.get(AsCase, c["id"]).site_address_detail, "3층 301호")
+        r = self.client.put(f"/api/portal/cases/{c['id']}", json={"site_address_detail": ""}, headers=self.h())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNone(self.db.get(AsCase, c["id"]).site_address_detail)
+        r = self.raw_create(site_address_detail="가" * 201)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("200자", r.json()["detail"])
+
     # ---- 로그인 ----
     def test_login_and_me(self):
         r = self.client.post("/api/portal/login", json={"login_id": " UserA ", "password": PW})

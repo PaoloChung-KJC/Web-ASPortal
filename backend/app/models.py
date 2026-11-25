@@ -106,6 +106,7 @@ class AsCase(Base):
     symptom = Column(Text, nullable=False)
     site_name = Column(String(120))
     site_address = Column(String(255))
+    site_address_detail = Column(String(200))  # 상세주소 (2026-11-24 — crm-rma 가 먼저 열을 더한다)
     site_phone = Column(String(40))
     action_note = Column(Text)          # 고객에게 안 보임
     delivery_note = Column(Text)        # 고객에게 안 보임
