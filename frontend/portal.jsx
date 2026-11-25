@@ -279,6 +279,26 @@ function videoDuration(file) {
   });
 }
 
+// 2026-11-25: 웹 화면의 [찍기]로 바로 찍으면 폰이 화질을 낮춰 넘긴다(아이폰 360×480 확인) → 카메라 앱으로 찍고 고르게 안내.
+// 아이폰은 '사진 보관함', 안드로이드(갤럭시 등)는 '갤러리' — 모르면 둘 다 적는다
+function phoneKind() {
+  const ua = (navigator.userAgent || "") + " " + (navigator.platform || "");
+  if (/iPhone|iPad|iPod/i.test(ua) || (/Mac/i.test(ua) && navigator.maxTouchPoints > 1)) return "ios";
+  if (/Android/i.test(ua)) return "android";
+  return "";
+}
+
+function CaptureTip() {
+  const kind = phoneKind();
+  const where = kind === "ios" ? "사진 보관함" : kind === "android" ? "갤러리" : "사진 보관함(갤러리)";
+  return (
+    <p className="capture-tip">
+      <b>영상은 휴대폰 카메라 앱으로 먼저 찍어 주세요.</b> 그다음 아래 버튼을 눌러 <b>{where}</b>에서 고르면 됩니다.
+      이 화면에서 바로 찍으면 화질이 낮게 저장될 수 있습니다.
+    </p>
+  );
+}
+
 function fmtTime(sec) {
   const s = Math.max(0, Math.round(sec));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -1306,6 +1326,7 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
               <span className="opt">(사진 {countKind(photos, "photo")}/{PHOTO_MAX} · 영상 {countKind(photos, "video")}/{VIDEO_MAX})</span></h2>
             <p className="field-hint">고장 부위와 제품 라벨이 보이게 찍어 주세요. 사진 또는 영상을 1개 이상 올려야 접수됩니다.
               깜박임·소리처럼 움직임이 있는 증상은 영상으로 찍어 주시면 좋습니다. 영상은 1분까지이며, 길면 올릴 구간을 고를 수 있습니다.</p>
+            <CaptureTip />
             {photoError && <Banner kind="error">{photoError}</Banner>}
             <Messages items={photoNotes} />
             {photos.length > 0 && (
@@ -1670,6 +1691,7 @@ function CaseScreen({ id }) {
               onClick={() => fileRef.current && fileRef.current.click()}>
               {busy === "photo" ? <><Spinner /> 올리는 중…</> : "사진·영상 추가"}
             </button>
+            <CaptureTip />
           </>
         )}
       </div>
