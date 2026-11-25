@@ -34,9 +34,9 @@ async def lifespan(app: FastAPI):
     elif not upload_dir.exists():
         log.info("사진 폴더가 아직 없습니다(첫 사진을 올릴 때 만든다): %s", upload_dir)
     if FFMPEG_PATH:
-        log.info("영상 변환 프로그램: %s", FFMPEG_PATH)
+        log.info("영상 자르기 프로그램: %s", FFMPEG_PATH)
     else:
-        log.warning("ffmpeg 를 찾지 못했습니다 — 고객 영상은 FHD 로 줄이지 않고 원본 그대로 저장됩니다(backend/.env 의 FFMPEG_PATH)")
+        log.warning("ffmpeg 를 찾지 못했습니다 — 1분이 넘는 고객 영상도 자르지 않고 원본 그대로 저장됩니다(backend/.env 의 FFMPEG_PATH)")
     yield
 
 

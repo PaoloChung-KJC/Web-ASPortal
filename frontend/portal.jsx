@@ -14,6 +14,8 @@ const PHOTO_LONG_SIDE = 2048; // 2026-11-24: 2K (전에는 1600)
 // 2026-11-24: 영상 — 길이 제한 없음, 원본 한 개 1GB 까지. 서버가 FHD 로 줄여 저장한다(backend VIDEO_MAX_MB 와 같게)
 const VIDEO_MAX = 3;
 const VIDEO_MAX_MB = 1024;
+// 2026-11-25: 영상은 1분까지. 넘으면 구간 선택 창에서 1분을 고르고, 서버가 그 구간만 떼어 저장한다(backend video.TRIM_MAX_SEC)
+const VIDEO_MAX_SEC = 60;
 const VIDEO_EXT = /\.(mp4|m4v|mov|3gp|3g2|webm|mkv)$/i;
 // 2026-11-24: 증상 예시 — 고객이 골라 쓰고, 없거나 더 적을 내용은 '기타 · 추가 증상 설명'에
 const SYMPTOM_EXAMPLES = [
@@ -95,6 +97,10 @@ async function api(path, opts = {}) {
 function uploadMedia(caseId, item, n, onProgress) {
   const form = new FormData();
   form.append("file", item.blob, item.kind === "video" ? (item.name || `video-${n}.mp4`) : `photo-${n}.jpg`);
+  if (item.trim) { // 고른 구간 — 서버가 이 구간(최대 1분)만 남긴다
+    form.append("trim_start", item.trim.start.toFixed(3));
+    form.append("trim_end", item.trim.end.toFixed(3));
+  }
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${API}/cases/${caseId}/photos`);
@@ -212,12 +218,21 @@ async function prepareFiles(files, photoRoom, videoRoom) {
   const tooBig = [];
   let overPhoto = 0;
   let overVideo = 0;
+  const skipped = [];
   for (const f of files) {
     if (isVideoFile(f)) {
       if (videoRoom <= 0) { overVideo += 1; continue; }
       if (f.size > VIDEO_MAX_MB * 1024 * 1024) { tooBig.push(f.name || "영상"); continue; }
+      // 길이를 잰다. 1분이 넘으면 구간을 고르게 하고, 길이를 못 재면(브라우저가 못 여는 형식) 서버가 앞 1분만 남긴다
+      const duration = await videoDuration(f);
+      let trim = null;
+      if (duration == null) trim = { start: 0, end: VIDEO_MAX_SEC };
+      else if (duration > VIDEO_MAX_SEC + 0.5) {
+        trim = await askTrim(f, duration, { start: 0, end: VIDEO_MAX_SEC });
+        if (!trim) { skipped.push(f.name || "영상"); continue; }
+      }
       videoRoom -= 1;
-      items.push({ kind: "video", blob: f, name: f.name || "" });
+      items.push({ kind: "video", blob: f, name: f.name || "", duration, trim });
       continue;
     }
     if (photoRoom <= 0) { overPhoto += 1; continue; }
@@ -231,7 +246,206 @@ async function prepareFiles(files, photoRoom, videoRoom) {
   if (tooBig.length) notes.push({ kind: "warn", text: `영상은 한 개 ${VIDEO_MAX_MB.toLocaleString()}MB 까지 올릴 수 있습니다 — ${tooBig.join(", ")}` });
   if (overPhoto > 0) notes.push({ kind: "warn", text: `사진은 최대 ${PHOTO_MAX}장까지 올릴 수 있습니다. ${overPhoto}장은 넣지 않았습니다` });
   if (overVideo > 0) notes.push({ kind: "warn", text: `영상은 최대 ${VIDEO_MAX}개까지 올릴 수 있습니다. ${overVideo}개는 넣지 않았습니다` });
+  if (skipped.length) notes.push({ kind: "warn", text: `구간을 고르지 않아 넣지 않았습니다 — ${skipped.join(", ")}` });
   return { items, notes };
+}
+
+// 영상 길이(초). 브라우저가 못 여는 형식이거나 8초 안에 못 읽으면 null
+function videoDuration(file) {
+  return new Promise((resolve) => {
+    const v = document.createElement("video");
+    const url = URL.createObjectURL(file);
+    let done = false;
+    const finish = (d) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      v.removeAttribute("src");
+      try { v.load(); } catch (e) { /* 무시 */ }
+      URL.revokeObjectURL(url);
+      resolve(d);
+    };
+    const timer = setTimeout(() => finish(null), 8000);
+    v.preload = "metadata";
+    v.muted = true;
+    v.onloadedmetadata = () => {
+      if (Number.isFinite(v.duration) && v.duration > 0) { finish(v.duration); return; }
+      // 일부 webm 은 길이가 Infinity 로 나온다 → 끝으로 한 번 옮겨 보면 진짜 길이가 나온다
+      v.ontimeupdate = () => { v.ontimeupdate = null; finish(Number.isFinite(v.duration) ? v.duration : null); };
+      try { v.currentTime = 1e9; } catch (e) { finish(null); }
+    };
+    v.onerror = () => finish(null);
+    v.src = url;
+  });
+}
+
+function fmtTime(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// ---- 영상 구간 선택 (1분이 넘는 영상) — 어디서든 askTrim() 으로 열고, 고른 구간 {start, end} 또는 null(취소)을 받는다 ----
+
+const trimBus = { open: null };
+function askTrim(file, duration, initial) {
+  return new Promise((resolve) => {
+    if (!trimBus.open) { resolve(initial); return; } // 창을 띄울 곳이 없으면 앞 1분
+    trimBus.open({ file, duration, initial, resolve });
+  });
+}
+
+function TrimHost() {
+  const [req, setReq] = useState(null);
+  useEffect(() => {
+    trimBus.open = (r) => setReq(r);
+    return () => { trimBus.open = null; };
+  }, []);
+  if (!req) return null;
+  const close = (result) => { req.resolve(result); setReq(null); };
+  return <TrimSheet file={req.file} duration={req.duration} initial={req.initial} onDone={close} />;
+}
+
+function TrimSheet({ file, duration, initial, onDone }) {
+  const maxLen = Math.min(VIDEO_MAX_SEC, duration);
+  const [range, setRange] = useState(() => {
+    const s = Math.max(0, Math.min(initial.start, duration - 1));
+    return { start: s, end: Math.min(duration, Math.max(s + 1, Math.min(initial.end, s + maxLen))) };
+  });
+  const [url] = useState(() => URL.createObjectURL(file));
+  const [playing, setPlaying] = useState(false);
+  const videoRef = useRef(null);
+  const trackRef = useRef(null);
+  const boxRef = useRef(null);
+  const drag = useRef(null);
+  const rangeRef = useRef(range);
+  rangeRef.current = range;
+
+  useEffect(() => {
+    const prev = document.activeElement;
+    if (boxRef.current) boxRef.current.focus();
+    document.body.classList.add("no-scroll");
+    return () => {
+      document.body.classList.remove("no-scroll");
+      URL.revokeObjectURL(url);
+      if (prev && prev.focus) prev.focus();
+    };
+  }, [url]);
+
+  const seek = (t) => { const v = videoRef.current; if (v) { try { v.currentTime = t; } catch (e) { /* 무시 */ } } };
+  const stop = () => { const v = videoRef.current; if (v) v.pause(); setPlaying(false); };
+  const togglePlay = () => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (playing) { stop(); return; }
+    seek(range.start);
+    v.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+  };
+  const onTime = () => {
+    const v = videoRef.current;
+    if (v && playing && v.currentTime >= rangeRef.current.end) { stop(); seek(rangeRef.current.start); }
+  };
+
+  // what: "start" | "end" | "move" — 시작은 끝보다 1초 이상 앞, 길이는 최대 1분
+  const apply = (what, t, grabOffset) => {
+    setRange((r) => {
+      let { start, end } = r;
+      if (what === "start") {
+        start = Math.min(Math.max(t, end - maxLen, 0), end - 1);
+        seek(start);
+      } else if (what === "end") {
+        end = Math.max(Math.min(t, start + maxLen, duration), start + 1);
+        seek(end);
+      } else {
+        const len = end - start;
+        start = Math.min(Math.max(t - grabOffset, 0), duration - len);
+        end = start + len;
+        seek(start);
+      }
+      return { start, end };
+    });
+  };
+  const timeAt = (clientX) => {
+    const box = trackRef.current.getBoundingClientRect();
+    return Math.min(Math.max((clientX - box.left) / box.width, 0), 1) * duration;
+  };
+  const onDown = (what) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    stop();
+    const t = timeAt(e.clientX);
+    drag.current = { what, offset: t - rangeRef.current.start };
+    e.currentTarget.setPointerCapture && e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onMove = (e) => {
+    if (!drag.current) return;
+    apply(drag.current.what, timeAt(e.clientX), drag.current.offset);
+  };
+  const onUp = () => { drag.current = null; };
+  const onKey = (what) => (e) => {
+    const step = e.shiftKey ? 5 : 1;
+    const delta = e.key === "ArrowLeft" || e.key === "ArrowDown" ? -step : e.key === "ArrowRight" || e.key === "ArrowUp" ? step : 0;
+    if (!delta) return;
+    e.preventDefault();
+    stop();
+    const r = rangeRef.current;
+    if (what === "move") apply("move", r.start + delta, 0);
+    else apply(what, (what === "start" ? r.start : r.end) + delta, 0);
+  };
+
+  const pct = (t) => `${(t / duration) * 100}%`;
+  const len = range.end - range.start;
+  return (
+    <div className="sheet-wrap">
+      <div className="sheet sheet-trim" role="dialog" aria-modal="true" aria-labelledby="trim-title" tabIndex={-1} ref={boxRef}>
+        <div className="sheet-head">
+          <h2 className="sheet-title" id="trim-title">영상 구간 선택</h2>
+          <button type="button" className="sheet-close" onClick={() => onDone(null)} aria-label="닫기">✕</button>
+        </div>
+        <p className="sheet-hint">영상은 1분까지 올릴 수 있습니다(이 영상은 {fmtTime(duration)}). 양쪽 손잡이로 길이를, 가운데를 끌어 위치를 정해 주세요.</p>
+        <div className="trim-video">
+          <video ref={videoRef} src={url} playsInline preload="metadata" onTimeUpdate={onTime}
+            onLoadedMetadata={() => seek(range.start)} onPause={() => setPlaying(false)} />
+        </div>
+        <div className="trim-body">
+          <div className="trim-times">
+            <span>{fmtTime(range.start)} ~ {fmtTime(range.end)}</span>
+            <b>{fmtTime(len)} 선택</b>
+          </div>
+          <div className="trim-track" ref={trackRef} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+            onPointerDown={(e) => { // 빈 곳을 누르면 그 자리로 구간을 옮긴다
+              if (e.target !== e.currentTarget) return;
+              stop();
+              const r = rangeRef.current;
+              apply("move", timeAt(e.clientX), (r.end - r.start) / 2);
+            }}>
+            <div className="trim-sel" style={{ left: pct(range.start), width: pct(len) }}
+              role="slider" tabIndex={0} aria-label="구간 위치" aria-valuemin={0} aria-valuemax={Math.round(duration)}
+              aria-valuenow={Math.round(range.start)} aria-valuetext={`${fmtTime(range.start)}부터`}
+              onPointerDown={onDown("move")} onKeyDown={onKey("move")} />
+            <div className="trim-handle trim-handle-start" style={{ left: pct(range.start) }}
+              role="slider" tabIndex={0} aria-label="시작" aria-valuemin={0} aria-valuemax={Math.round(duration)}
+              aria-valuenow={Math.round(range.start)} aria-valuetext={fmtTime(range.start)}
+              onPointerDown={onDown("start")} onKeyDown={onKey("start")}><span /></div>
+            <div className="trim-handle trim-handle-end" style={{ left: pct(range.end) }}
+              role="slider" tabIndex={0} aria-label="끝" aria-valuemin={0} aria-valuemax={Math.round(duration)}
+              aria-valuenow={Math.round(range.end)} aria-valuetext={fmtTime(range.end)}
+              onPointerDown={onDown("end")} onKeyDown={onKey("end")}><span /></div>
+          </div>
+          <div className="trim-scale"><span>0:00</span><span>{fmtTime(duration)}</span></div>
+          <button type="button" className="btn btn-secondary btn-block" onClick={togglePlay}>
+            {playing ? "■ 멈춤" : "▶ 고른 구간 재생"}
+          </button>
+          <p className="field-hint">저장할 때 시작 위치가 1~2초 앞당겨질 수 있습니다.</p>
+        </div>
+        <div className="sheet-foot trim-foot">
+          <button type="button" className="btn btn-secondary btn-lg" onClick={() => onDone(null)}>취소</button>
+          <button type="button" className="btn btn-primary btn-lg" onClick={() => { stop(); onDone({ start: range.start, end: range.end }); }}>
+            이 구간 사용
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // 여러 개를 차례로 올린다. 401 이면 멈추고 { stopped: true }
@@ -877,6 +1091,14 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
     setPreparing(false);
   };
 
+  // 1분이 넘는 영상: 미리 보기 칸을 누르면 구간을 다시 고른다(취소하면 그대로)
+  const changeTrim = async (key) => {
+    const it = photos.find((x) => x.key === key);
+    if (!it || !(it.duration > VIDEO_MAX_SEC + 0.5)) return;
+    const t = await askTrim(it.blob, it.duration, it.trim || { start: 0, end: VIDEO_MAX_SEC });
+    if (t && alive.current) setPhotos((list) => list.map((x) => (x.key === key ? { ...x, trim: t } : x)));
+  };
+
   const removePhoto = (key) => {
     setPhotos((p) => p.filter((x) => {
       if (x.key !== key) return true;
@@ -1083,7 +1305,7 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
             <h2 className="section-title">사진·영상 <span className="req">(필수)</span>{" "}
               <span className="opt">(사진 {countKind(photos, "photo")}/{PHOTO_MAX} · 영상 {countKind(photos, "video")}/{VIDEO_MAX})</span></h2>
             <p className="field-hint">고장 부위와 제품 라벨이 보이게 찍어 주세요. 사진 또는 영상을 1개 이상 올려야 접수됩니다.
-              깜박임·소리처럼 움직임이 있는 증상은 영상으로 찍어 주시면 좋습니다.</p>
+              깜박임·소리처럼 움직임이 있는 증상은 영상으로 찍어 주시면 좋습니다. 영상은 1분까지이며, 길면 올릴 구간을 고를 수 있습니다.</p>
             {photoError && <Banner kind="error">{photoError}</Banner>}
             <Messages items={photoNotes} />
             {photos.length > 0 && (
@@ -1091,7 +1313,17 @@ function CaseForm({ mode, initial, onSaved, onCancel, onConflict }) {
                 {photos.map((p, i) => (
                   <li key={p.key} className="thumb">
                     {p.kind === "video"
-                      ? <div className="thumb-video"><video src={`${p.url}#t=0.1`} muted playsInline preload="metadata" aria-label={`고른 영상 ${i + 1}`} /><span className="thumb-badge">▶ 영상</span></div>
+                      ? (
+                        <button type="button" className="thumb-video" onClick={() => changeTrim(p.key)}
+                          disabled={!(p.duration > VIDEO_MAX_SEC + 0.5)}
+                          aria-label={p.duration > VIDEO_MAX_SEC + 0.5 ? `영상 ${i + 1} 구간 바꾸기` : `고른 영상 ${i + 1}`}>
+                          <video src={`${p.url}#t=${p.trim ? p.trim.start + 0.1 : 0.1}`} muted playsInline preload="metadata" />
+                          <span className="thumb-badge">
+                            ▶ {p.trim && p.duration ? `${fmtTime(p.trim.start)}~${fmtTime(p.trim.end)}` : p.duration ? fmtTime(p.duration) : "영상"}
+                          </span>
+                          {p.duration > VIDEO_MAX_SEC + 0.5 && <span className="thumb-edit">구간 바꾸기</span>}
+                        </button>
+                      )
                       : <img src={p.url} alt={`고른 사진 ${i + 1}`} />}
                     <button type="button" className="thumb-remove" onClick={() => removePhoto(p.key)}
                       aria-label={`${p.kind === "video" ? "영상" : "사진"} ${i + 1} 빼기`}>
@@ -1319,9 +1551,6 @@ function CaseScreen({ id }) {
     const out = notes.slice();
     const ok = items.length - failed;
     if (ok > 0) out.unshift({ kind: "ok", text: `${ok}개를 올렸습니다` });
-    if (ok > 0 && items.some((x) => x.kind === "video")) {
-      out.push({ kind: "info", text: "영상은 저장 뒤 몇 분 동안 화질을 줄이는 작업을 합니다. 그동안 영상이 안 보이면 잠시 뒤 새로 고쳐 주세요" });
-    }
     if (failed) out.push({ kind: "warn", text: `${failed}개를 올리지 못했습니다 — ${lastErr}` });
     setMsgs(out);
     await reload(true);
@@ -1595,4 +1824,4 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(<><App /><TrimHost /></>);

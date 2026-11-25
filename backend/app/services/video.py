@@ -1,35 +1,38 @@
-"""A/S 영상 받기 · FHD 변환 (2026-11-24 사용자 결정).
+"""A/S 영상 받기 · 1분 구간 자르기.
 
-흐름: 고객이 올린 원본을 서버 작업 폴더에 받는다 → 원본을 NAS 사진 폴더에 바로 저장(접수 화면은 기다리지 않는다)
-     → 뒤에서 ffmpeg 로 FHD(가로세로 1920×1080 안) H.264 MP4 로 바꾼다 → 바뀐 파일로 행을 갈아 끼우고 원본은 지운다.
-- ffmpeg 가 없거나 변환에 실패하면 원본을 그대로 둔다 — 접수 증거가 없어지지 않게.
-- 행을 고치지 않고 '새 행 추가 + 옛 행 삭제'로 바꾼다: 이 사이트의 DB 계정은 as_case_photo 에 UPDATE 권한이 없다(preflight).
-- 변환은 한 번에 하나씩(같은 서버에 SQL Server 가 돈다) · 낮은 우선순위로 돌린다.
+2026-11-24 처음에는 서버에서 FHD 로 다시 압축(변환)했으나 느리고(16초 영상에 17분) 복잡해서
+2026-11-25 사용자 결정으로 뺐다. 지금 규칙:
+- 1분 이하 영상: 원본 그대로 저장 (ffmpeg 를 쓰지 않는다)
+- 1분이 넘는 영상: 고객이 화면에서 최대 1분 구간을 고른다(trim_start · trim_end) → 서버가 ffmpeg 로
+  그 구간만 '다시 압축하지 않고'(-c copy) 떼어 저장한다. 1~2초면 끝나고 화질이 그대로다. 요청 안에서 끝낸다.
+- ffmpeg 가 없거나 자르기에 실패하면 원본 전체를 그대로 둔다 — 접수 증거가 없어지지 않게.
+- -c copy 는 키프레임에서만 자를 수 있어 시작이 고른 곳보다 몇 초 앞당겨질 수 있다.
 - 폴더 규칙은 사진과 같다: <AS_UPLOAD_DIR>/<접수 id>/<uuid>.<확장자> — 직원 화면(crm-rma)이 같은 폴더에서 읽는다.
 """
 import logging
 import shutil
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
+import time
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException
 
-from ..config import AS_UPLOAD_DIR, FFMPEG_PATH, VIDEO_MAX_BYTES, VIDEO_TIMEOUT_SEC, VIDEO_WORK_DIR
+from ..config import AS_UPLOAD_DIR, FFMPEG_PATH, VIDEO_MAX_BYTES, VIDEO_WORK_DIR
 from ..models import AsCasePhoto
 
 log = logging.getLogger(__name__)
 
 CUSTOMER_VIDEO_MAX = 3
+TRIM_MAX_SEC = 60          # 영상 길이 한도 (사용자 결정 2026-11-25) — 화면 portal.jsx VIDEO_MAX_SEC 와 같게
+TRIM_TIMEOUT_SEC = 180     # 자르기(복사)는 보통 몇 초 — 이보다 길면 원본 그대로
 STORAGE_DOWN = "영상을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요"
 NOT_VIDEO = "사진(JPG·PNG) 또는 영상(MP4·MOV) 파일만 올릴 수 있습니다"
 
 # ftyp 상자로 시작하지만 영상이 아닌 것 (아이폰 사진 HEIC · AVIF 등)
 _IMAGE_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1", b"avif", b"avis"}
 
-_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video")
 
 
 def is_video(content_type) -> bool:
@@ -71,7 +74,7 @@ def work_file() -> Path:
 
 
 def store_original(db, case, src: Path, orig_name: str, by: str, by_name: str) -> AsCasePhoto:
-    """작업 폴더의 원본(src)을 NAS 사진 폴더에 복사하고 행을 더한다(flush). src 는 지우지 않는다(변환에 쓴다)."""
+    """작업 폴더의 원본(src)을 NAS 사진 폴더에 복사하고 행을 더한다(flush). src 는 지우지 않는다(부른 쪽이 지운다)."""
     with open(src, "rb") as f:
         head = f.read(16)
     kind = sniff_video(head)
@@ -99,22 +102,43 @@ def store_original(db, case, src: Path, orig_name: str, by: str, by_name: str) -
     return row
 
 
-def ffmpeg_cmd(ffmpeg: str, src: Path, dst: Path) -> list:
-    """FHD(가로 영상 1920×1080, 세로 영상 1080×1920 안)로 줄인 H.264/AAC MP4. 작은 영상은 키우지 않는다."""
-    scale = ("scale=w='min(iw,if(gte(iw,ih),1920,1080))':h='min(ih,if(gte(iw,ih),1080,1920))'"
-             ":force_original_aspect_ratio=decrease:force_divisible_by=2")
-    return [
+def trim_span(start, end) -> tuple:
+    """(시작 초, 길이 초). 길이는 1분을 넘지 않는다. 끝이 없거나 시작보다 앞이면 1분."""
+    s = max(0.0, float(start or 0))
+    length = float(TRIM_MAX_SEC)
+    if end is not None and float(end) > s:
+        length = min(length, float(end) - s)
+    return s, length
+
+
+def trim_cmd(ffmpeg: str, src: Path, dst: Path, start: float, length: float) -> list:
+    """다시 압축하지 않고(-c copy) start 부터 length 초만 떼어 낸다. 입력 앞 -ss 는 가까운 키프레임으로 빠르게 간다."""
+    cmd = [
         ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-        "-i", str(src),
-        "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", scale, "-fpsmax", "30",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k",
-        "-map_metadata", "-1",            # 촬영 위치(GPS) 같은 정보는 남기지 않는다
-        "-movflags", "+faststart",        # 다 받기 전에 재생이 시작되게
-        "-threads", "2",
-        "-f", "mp4", str(dst),
+        "-ss", f"{float(start):.3f}", "-i", str(src), "-t", f"{float(length):.3f}",
+        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
     ]
+    if Path(dst).suffix.lower() in (".mp4", ".mov", ".3gp", ".m4v"):
+        cmd += ["-movflags", "+faststart"]      # 다 받기 전에 재생이 시작되게 (mp4 계열에만 있는 옵션)
+    return cmd + [str(dst)]
+
+
+def trim(src: Path, start, end, ext: str):
+    """src 의 고른 구간을 작업 폴더의 새 파일로 떼어 내 그 경로를 돌려준다. 못 하면 None(결과 조각은 지운다)."""
+    if not FFMPEG_PATH:
+        log.warning("ffmpeg 가 없어 영상을 자르지 못하고 원본 그대로 둡니다")
+        return None
+    s, length = trim_span(start, end)
+    out = Path(VIDEO_WORK_DIR) / f"{uuid4().hex}{ext}"
+    began = time.monotonic()
+    ok = _run(trim_cmd(FFMPEG_PATH, Path(src), out, s, length), TRIM_TIMEOUT_SEC)
+    if not ok or not out.is_file() or out.stat().st_size == 0:
+        _unlink(out)
+        return None
+    log.info("영상 자르기 %.1f초부터 %.1f초 · %.1fMB → %.1fMB · %.1f초 걸림", s, length,
+             Path(src).stat().st_size / 1048576, out.stat().st_size / 1048576, time.monotonic() - began)
+    return out
 
 
 def _run(cmd, timeout) -> bool:
@@ -124,14 +148,14 @@ def _run(cmd, timeout) -> bool:
     try:
         r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout, creationflags=flags)
     except subprocess.TimeoutExpired:
-        log.warning("영상 변환 시간 초과(%s초) — 원본을 그대로 둔다", timeout)
+        log.warning("영상 자르기 시간 초과(%s초) — 원본을 그대로 둔다", timeout)
         return False
     except OSError:
         log.exception("ffmpeg 를 실행하지 못했습니다: %s", cmd[0])
         return False
     if r.returncode != 0:
         tail = (r.stderr or b"")[-800:].decode("utf-8", "replace")
-        log.warning("영상 변환 실패(코드 %s) — 원본을 그대로 둔다: %s", r.returncode, tail)
+        log.warning("영상 자르기 실패(코드 %s) — 원본을 그대로 둔다: %s", r.returncode, tail)
         return False
     return True
 
@@ -141,54 +165,3 @@ def _unlink(path) -> None:
         Path(path).unlink(missing_ok=True)
     except OSError:
         log.warning("파일을 지우지 못했습니다: %s", path)
-
-
-def convert_video(photo_id: int, src: Path, session_factory) -> None:
-    """뒤에서 도는 변환. 어떤 경우에도 예외를 밖으로 내지 않고, 작업 폴더의 파일(src · 결과)은 지운다."""
-    out = Path(VIDEO_WORK_DIR) / f"{uuid4().hex}.mp4"
-    try:
-        if not FFMPEG_PATH:
-            log.warning("ffmpeg 가 없어 영상을 원본 그대로 둡니다 photo_id=%s", photo_id)
-            return
-        if not (_run(ffmpeg_cmd(FFMPEG_PATH, Path(src), out), VIDEO_TIMEOUT_SEC) and out.is_file() and out.stat().st_size > 0):
-            return
-        db = session_factory()
-        dest = None
-        try:
-            old = db.get(AsCasePhoto, photo_id)
-            if old is None:      # 변환하는 사이 고객이 지웠다
-                return
-            old_path = Path(AS_UPLOAD_DIR) / f"{old.case_id}" / old.stored_name
-            dest = Path(AS_UPLOAD_DIR) / f"{old.case_id}" / f"{uuid4().hex}.mp4"
-            try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(out, dest)
-            except OSError:
-                log.exception("변환한 영상을 저장하지 못했습니다 — 원본을 그대로 둔다 photo_id=%s", photo_id)
-                _unlink(dest)
-                return
-            new = AsCasePhoto(case_id=old.case_id, stored_name=dest.name, orig_name=old.orig_name,
-                              content_type="video/mp4", size=dest.stat().st_size, uploaded_by=old.uploaded_by,
-                              uploaded_by_name=old.uploaded_by_name, created_at=old.created_at)
-            db.add(new)
-            db.delete(old)
-            db.commit()
-            _unlink(old_path)
-            log.info("영상 변환 완료 photo_id=%s → %s", photo_id, new.id)
-        except Exception:
-            db.rollback()
-            log.exception("영상 변환 결과를 반영하지 못했습니다 — 원본을 그대로 둔다 photo_id=%s", photo_id)
-            if dest is not None:
-                _unlink(dest)
-        finally:
-            db.close()
-    except Exception:
-        log.exception("영상 변환 중 오류 photo_id=%s", photo_id)
-    finally:
-        _unlink(src)
-        _unlink(out)
-
-
-def schedule(photo_id: int, src: Path) -> None:
-    from ..database import SessionLocal
-    _executor.submit(convert_video, photo_id, Path(src), SessionLocal)

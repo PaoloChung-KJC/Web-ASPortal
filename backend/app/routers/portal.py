@@ -7,7 +7,7 @@ crm-rma routers/as_portal.py 를 옮긴 것(주소·응답·문구 동일).
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -347,8 +347,13 @@ def cancel_case(case_id: int, db: Session = Depends(get_db), account: AsPortalAc
 # ---- 사진 ----
 
 @router.post("/cases/{case_id}/photos")
-def upload_photo(case_id: int, file: UploadFile = File(...), db: Session = Depends(get_db),
+def upload_photo(case_id: int, file: UploadFile = File(...), trim_start: Optional[str] = Form(None),
+                 trim_end: Optional[str] = Form(None), db: Session = Depends(get_db),
                  account: AsPortalAccount = Depends(get_active_account)):
+    # trim_start · trim_end: 1분이 넘는 영상에서 고객이 고른 구간(초). 있으면 그 구간(최대 1분)만 남긴다
+    trim = None
+    if trim_start not in (None, ""):
+        trim = (_seconds(trim_start), _seconds(trim_end) if trim_end not in (None, "") else None)
     c = _get_case(db, account, case_id)
     if not customer_can_add_photo(c.status):
         raise HTTPException(409, "사진을 더 올릴 수 없는 접수입니다")
@@ -362,8 +367,9 @@ def upload_photo(case_id: int, file: UploadFile = File(...), db: Session = Depen
         return {"id": p.id, "orig_name": p.orig_name, "kind": "photo"}
     if not as_video.sniff_video(head):
         raise HTTPException(400, as_video.NOT_VIDEO)
-    # 영상: 서버 작업 폴더로 받아(한도를 넘으면 그 자리에서 멈춘다) 원본을 저장하고, FHD 변환은 뒤에서 한다
+    # 영상: 서버 작업 폴더로 받아(한도를 넘으면 그 자리에서 멈춘다), 구간이 왔으면 잘라 내고, 저장한다
     work = as_video.work_file()
+    cut = None
     try:
         total = 0
         with open(work, "wb") as out:
@@ -375,17 +381,32 @@ def upload_photo(case_id: int, file: UploadFile = File(...), db: Session = Depen
                 if total > as_video.VIDEO_MAX_BYTES:
                     raise HTTPException(400, as_video.too_big_message())
                 out.write(chunk)
-        p = as_video.store_original(db, c, work, file.filename or "", "customer", by_name)
+        kind = as_video.sniff_video(head)
+        if trim is not None:
+            cut = as_video.trim(work, trim[0], trim[1], kind[1])   # 못 자르면 None → 원본 그대로
+        p = as_video.store_original(db, c, cut or work, file.filename or "", "customer", by_name)
         db.commit()
     except BaseException:
         db.rollback()
-        try:
-            work.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise
-    as_video.schedule(p.id, work)
+    finally:
+        for f in (work, cut):
+            if f is not None:
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
     return {"id": p.id, "orig_name": p.orig_name, "kind": "video"}
+
+
+def _seconds(v) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "영상 구간 값을 확인해 주세요")
+    if x != x or x in (float("inf"), float("-inf")) or x < 0 or x > 86400:
+        raise HTTPException(400, "영상 구간 값을 확인해 주세요")
+    return x
 
 
 def _customer_photo(db: Session, c: AsCase, pid: int) -> AsCasePhoto:
